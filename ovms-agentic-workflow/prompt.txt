@@ -1,0 +1,137 @@
+# CONTEXT AND GOAL
+You are an expert AI software engineer with root access to a dedicated Linux VM. Your task is to execute a "YOLO mode" (full autonomy, write code, run commands, install dependencies, test, and iterate until success) mission. 
+
+**The Goal:** Make the provided `agent.py` script work successfully with the experimental **OpenVINO/gemma-4-E4B-it-int8-ov** model to execute SSH commands via the Model Context Protocol (MCP).
+
+## The Problem
+`agent.py` uses the `openai-agents` Python SDK, which expects an OpenAI-compatible REST API (like the one provided by OpenVINO Model Server - OVMS). However, the standard OVMS Docker image (`latest` and `2024.5`) crashes with the error `Unsupported 'gemma4' VLM model type` because the C++ GenAI backend does not yet support this experimental architecture.
+
+According to the model's `README.md`, Gemma 4 inference *is* supported via a custom Python fork of `optimum-intel`.
+
+## The Solution Architecture
+Since you have full root access to the VM, your objective is to:
+1. **Ditch the OVMS Docker container.**
+2. **Build a custom Python API Server (e.g., using FastAPI)** that exposes an OpenAI-compatible `/v3/chat/completions` (or `/v1/chat/completions`) endpoint.
+3. This custom server MUST load the `OpenVINO/gemma-4-E4B-it-int8-ov` model using the custom `optimum-intel` fork and handle the generation loop.
+4. It MUST support **tool calling** (parsing the model's text output into the JSON format expected by the OpenAI API schema).
+5. Keep `agent.py` exactly as it is (or make minimal changes to point to your new local FastAPI server port).
+6. Test the end-to-end flow to ensure `agent.py` can successfully trigger the SSH MCP tool.
+
+---
+
+# ENVIRONMENT SETUP INSTRUCTIONS (From Model README)
+To run the model inference, you MUST install these specific dependencies with `uv add`:
+```bash
+"git+https://github.com/rkazants/optimum-intel.git@support_gemma_4" --extra-index-url https://download.pytorch.org/whl/cpu
+transformers==5.5.0
+torchvision Pillow --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+Inference code snippet to build around:
+```python
+from optimum.intel.openvino import OVModelForVisualCausalLM
+from transformers import AutoProcessor
+
+model_id = "OpenVINO/gemma-4-E4B-it-int8-ov"
+processor = AutoProcessor.from_pretrained(model_id)
+# Note: For GPU use device="GPU", for CPU use device="CPU"
+model = OVModelForVisualCausalLM.from_pretrained(model_id, device="CPU") 
+
+# ... implement FastAPI endpoint that parses OpenAI schema, formats the prompt via processor.apply_chat_template, generates text, and returns the OpenAI compatible JSON response (especially handling tool_calls).
+```
+
+---
+
+# TARGET AGENT CODE (`agent.py`)
+This is the script that must successfully run and connect to your custom server.
+
+```python
+from __future__ import annotations
+import asyncio
+import os
+import argparse
+from openai import AsyncOpenAI
+from agents import Agent, Runner, RunConfig
+from agents.mcp import MCPServerStdio
+from agents.model_settings import ModelSettings
+from openai.types.responses import ResponseTextDeltaEvent
+from agents import (
+    Agent, Model, ModelProvider, OpenAIChatCompletionsModel, RunConfig, Runner,
+)
+
+API_KEY = "not_used"
+
+async def run_query(query, agent, OVMS_MODEL_PROVIDER, stream: bool = False):
+    for server in agent.mcp_servers:
+        await server.connect()
+    
+    if stream:
+        print("Gemma: ", end="", flush=True)
+        result = Runner.run_streamed(
+            starting_agent=agent, input=query, 
+            run_config=RunConfig(model_provider=OVMS_MODEL_PROVIDER, tracing_disabled=True)
+        )
+        async for event in result.stream_events():
+            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+                print(event.data.delta, end="", flush=True)
+            elif event.type == "run_item_stream_event":
+                if event.item.type == "tool_call_item":
+                    print(f"\n-- Tool '{event.item.raw_item.name}' called with: {event.item.raw_item.arguments}")
+                elif event.item.type == "tool_call_output_item":
+                    print(f"\n-- Tool output received.\n")
+        print() 
+    else:
+        result = await Runner.run(
+            starting_agent=agent, input=query, 
+            run_config=RunConfig(model_provider=OVMS_MODEL_PROVIDER, tracing_disabled=True)
+        )
+        print(f"Gemma: {result.final_output}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run OpenAI Agent with SSH MCP server.")
+    parser.add_argument("--query", type=str, help="Query to run")
+    parser.add_argument("--model", type=str, default="gemma-4-it", help="Model name to use")
+    parser.add_argument("--base-url", type=str, default="http://localhost:8000/v3", help="Base URL for the OpenAI API")
+    parser.add_argument("--stream", action="store_true", help="Stream output")
+    parser.add_argument("--tool-choice", type=str, default="auto", choices=["auto", "required"])
+    parser.add_argument("--enable-thinking", action="store_true")
+    args = parser.parse_args()
+
+    ssh_server = MCPServerStdio(
+        name="SSH MCP Server",
+        params={
+            "command": "npx",
+            "args": [
+                "-y", "@fangjunjie/ssh-mcp-server",
+                "--host", "192.168.137.110", "--port", "22",
+                "--username", "root", "--privateKey", "/root/.ssh/id_ed25519"
+            ],
+            "env": {"UV_INDEX": os.environ.get("UV_INDEX", "")}
+        }
+    )
+
+    client = AsyncOpenAI(base_url=args.base_url, api_key=API_KEY)
+    class OVMSModelProvider(ModelProvider):
+        def get_model(self, _) -> Model:
+            return OpenAIChatCompletionsModel(model=args.model, openai_client=client)
+
+    OVMS_MODEL_PROVIDER = OVMSModelProvider()
+    agent = Agent(
+        name="Assistant", mcp_servers=[ssh_server],
+        model_settings=ModelSettings(
+            tool_choice=args.tool_choice, temperature=0.0, max_tokens=1000, 
+            extra_body={"chat_template_kwargs": {"enable_thinking": args.enable_thinking}}
+        ),
+    )
+
+    if args.query:
+        asyncio.run(run_query(args.query, agent, OVMS_MODEL_PROVIDER, args.stream))
+```
+
+# YOUR MISSION DIRECTIVES
+1. **Initialize:** Create a new Python virtual environment (uv) and install the required `optimum-intel` fork and FastAPI dependencies (`uv add`).
+2. **Develop the Bridge:** Write `server.py` using FastAPI. Implement the `/v3/chat/completions` endpoint. 
+    - *CRITICAL:* The model natively outputs text. When `agent.py` sends `tools` in the API request, your server must format the prompt so Gemma knows about the tools, parse Gemma's text output to detect if it wants to call a tool, and translate that into the strict OpenAI `tool_calls` JSON response format. You can use standard regex/string parsing for this (e.g., look for `<tool_call>...` blocks).
+3. **Execute & Iterate:** Run `server.py` in the background. Then execute:
+   `python agent.py --query "Run the bash command 'touch /root/gemma4_yolo_test' on the remote server" --tool-choice required`
+4. **Fix Errors:** If it fails (due to schema mismatches, parsing errors, or dependency hell), read the stack traces, modify `server.py`, and restart it. You are autonomous. Do not stop until the SSH MCP tool is successfully triggered by the Gemma 4 model and the file is created on the remote server.

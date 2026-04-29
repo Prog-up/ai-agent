@@ -1,0 +1,11 @@
+{
+    "model_config_list": [
+        {
+            "config": {
+                "name": "gemma-4-it",
+                "base_path": "/model"
+            }
+        }
+    ],
+    "task": "text_generation"
+}
