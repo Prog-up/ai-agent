@@ -1,0 +1,24 @@
+services:
+  gemma4-api:
+    image: gemma4-ovms:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gemma4-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - /opt/models/gemma-4-E4B-it-int8-ov:/models:ro
+    environment:
+      - OV_CPU_BACKEND_NUM_THREADS=12
+    deploy:
+      resources:
+        limits:
+          memory: 48g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
