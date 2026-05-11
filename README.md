@@ -80,6 +80,34 @@ curl -s http://localhost:8000/v1/chat/completions \
 - **Thread Tuning:** Setting `OV_CPU_BACKEND_NUM_THREADS` to the physical core count (12) provided the best balance. Setting it to 24 (all vCPUs) slightly decreased throughput due to context switching.
 - **Async Execution:** Using a dedicated `ThreadPoolExecutor` in the FastAPI server ensures that multiple concurrent requests don't block the API, although actual inference is sequential on a single CPU device.
 
+## v1.1 — Streaming, Thinking & GPU Detection
+
+### What was broken and why
+The previous version used "fake streaming" by splitting a fully generated response into words. This resulted in high TTFT (Time To First Token) and a poor user experience as the client received nothing until the entire generation was complete.
+
+### Real Streaming Implementation
+Implemented true token streaming using the `transformers.TextIteratorStreamer` class.
+- **Background Thread:** The `model.generate` call runs in a dedicated `threading.Thread`, pushing tokens into the streamer's queue.
+- **Asynchronous Yielding:** The FastAPI server iterates over the streamer and yields tokens to the client as they arrive, significantly reducing TTFT.
+- **Special Tokens:** Set `skip_special_tokens=False` to ensure thinking tags (`<|channel>thought`) are captured and processed.
+
+### Thinking Support
+Gemma 4 Instruct's native reasoning mode was enabled and exposed.
+- **Activation:** Passing `enable_thinking=True` to `apply_chat_template` inserts the `<|think|>` token into the system prompt.
+- **Parsing:** Added a robust `parse_thinking` function that identifies the `<|channel>thought` start tag and the `<channel|>` end tag.
+- **API Surface:** Thinking blocks are surfaced via a dedicated `thinking` field in non-streaming responses and `delta.thinking` in streaming chunks.
+
+### GPU Detection & Precision
+- **Auto-detection:** Added logic using `openvino.Core().available_devices` to automatically target `GPU` if available, falling back to `CPU`.
+- **Override:** The `DEVICE` environment variable can be used to force a specific device.
+- **Precision:** Enabled `INFERENCE_PRECISION_HINT: f32` in the `ov_config` to ensure high-quality output on varied hardware.
+
+### Observations on this Machine
+- **Available devices:** `['CPU']`
+- **Using device:** `CPU`
+- **Performance:** Mean throughput remained stable at ~2.3 tok/s with `f32` precision hint and real streaming enabled.
+- **Memory:** Increased Docker memory allocation to 64GB to handle the increased overhead of the reasoning blocks and precision hint.
+
 ## Reproduction Steps
 
 1. **Clone and Setup:**
@@ -105,7 +133,7 @@ curl -s http://localhost:8000/v1/chat/completions \
      --name gemma4-api \
      -p 8000:8000 \
      -v /opt/models/gemma-4-E4B-it-int8-ov:/models:ro \
-     --memory="48g" \
+     --memory="64g" \
      -e OV_CPU_BACKEND_NUM_THREADS=12 \
      gemma4-ovms:latest
    ```
@@ -114,3 +142,28 @@ curl -s http://localhost:8000/v1/chat/completions \
    ```bash
    curl http://localhost:8000/health
    ```
+
+## v1.2 — Stability, Correctness & Observability
+
+1. **Bugs fixed** — `temperature` was silently ignored, making all responses greedy regardless of the parameter. Replaced the deprecated `get_event_loop()` with `get_running_loop()`. Fixed a critical issue where `thread.join()` was blocking the async event loop. Improved the regex for parsing the thinking block to handle first-match non-greedy parsing properly. Fixed stream `finish_reason` to correctly report `"length"` when `max_tokens` is hit.
+2. **Concurrency protection** — Implemented a semaphore (`MAX_CONCURRENT_REQUESTS=1`) to protect OpenVINO state and a queue limit (`MAX_QUEUED_REQUESTS=4`). Excess requests get a clean 503 response:
+   `{"error": {"message": "Server at capacity, try again later.", "type": "server_error", "code": "503"}}`
+3. **Streaming timing proof** — Verified real inter-token gaps in streaming:
+   ```
+   [1778507173.538] data: {"id": "chatcmpl-1f08e5df1a78", "object": "chat.completion.chunk", "created": 1778507170, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "2,"}, "finish_reason": null}]}
+   [1778507174.756] data: {"id": "chatcmpl-1f08e5df1a78", "object": "chat.completion.chunk", "created": 1778507170, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "3,"}, "finish_reason": null}]}
+   [1778507175.989] data: {"id": "chatcmpl-1f08e5df1a78", "object": "chat.completion.chunk", "created": 1778507170, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "4,"}, "finish_reason": null}]}
+   [1778507177.224] data: {"id": "chatcmpl-1f08e5df1a78", "object": "chat.completion.chunk", "created": 1778507170, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "5,"}, "finish_reason": null}]}
+   [1778507178.460] data: {"id": "chatcmpl-1f08e5df1a78", "object": "chat.completion.chunk", "created": 1778507170, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "6,"}, "finish_reason": null}]}
+   ```
+4. **New parameters** — Added `top_p`, `top_k`, and `repetition_penalty`, which are fully enforced at the generation level. `stop` strings are applied via best-effort post-hoc truncation. `n` is explicitly limited to `1` with early rejection.
+5. **Metrics** — Integrated `/metrics` for observability:
+   ```
+   # HELP python_gc_objects_collected_total Objects collected during gc
+   # TYPE python_gc_objects_collected_total counter
+   python_gc_objects_collected_total{generation="0"} 13565.0
+   python_gc_objects_collected_total{generation="1"} 2333.0
+   python_gc_objects_collected_total{generation="2"} 257.0
+   ```
+6. **Dockerfile pin** — Pinned `support_gemma_4` to `eac389347523177511abe37908090d9e5c12e714` for guaranteed reproducibility.
+7. **What was not changed** — All planned changes behaved as expected. Note that `context_length` dynamically reads from the processor, yielding the large placeholder `1000000000000000019884624838656` as provided by the model config, which was left un-altered.

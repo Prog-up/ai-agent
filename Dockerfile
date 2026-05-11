@@ -11,8 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ── Python deps ───────────────────────────────────────────────────────────────
 # Install the custom optimum-intel branch that supports Gemma 4
+# Pin to exact commit for reproducibility — update intentionally when upgrading
+ARG OPTIMUM_INTEL_SHA=eac389347523177511abe37908090d9e5c12e714
 RUN pip3 install --no-cache-dir \
-    "git+https://github.com/rkazants/optimum-intel.git@support_gemma_4" \
+    "git+https://github.com/rkazants/optimum-intel.git@${OPTIMUM_INTEL_SHA}" \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 RUN pip3 install --no-cache-dir \
@@ -21,7 +23,7 @@ RUN pip3 install --no-cache-dir \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 RUN pip3 install --no-cache-dir \
-    fastapi uvicorn[standard] pydantic
+    fastapi uvicorn[standard] pydantic prometheus-fastapi-instrumentator
 
 # ── Server code ───────────────────────────────────────────────────────────────
 WORKDIR /app
