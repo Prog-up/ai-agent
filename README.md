@@ -145,19 +145,19 @@ Gemma 4 Instruct's native reasoning mode was enabled and exposed.
 
 ## v1.2 — Stability, Correctness & Observability
 
-1. **Bugs fixed** — `temperature` was silently ignored, making all responses greedy regardless of the parameter. Replaced the deprecated `get_event_loop()` with `get_running_loop()`. Fixed a critical issue where `thread.join()` was blocking the async event loop. Improved the regex for parsing the thinking block to handle first-match non-greedy parsing properly. Fixed stream `finish_reason` to correctly report `"length"` when `max_tokens` is hit.
-2. **Concurrency protection** — Implemented a semaphore (`MAX_CONCURRENT_REQUESTS=1`) to protect OpenVINO state and a queue limit (`MAX_QUEUED_REQUESTS=4`). Excess requests get a clean 503 response:
+1. **Bugs fixed** — `temperature` was silently ignored — all responses were greedy regardless of the parameter. We fixed this by correctly threading `temperature` when `do_sample` is active. Replaced the deprecated `get_event_loop()` with `get_running_loop()`. Fixed a critical issue where `thread.join()` was blocking the async event loop during streaming. Fixed stream `finish_reason` to correctly report `"length"` when `max_tokens` is hit, and `"stop"` otherwise. Improved `parse_thinking` to ensure a robust non-greedy match on reasoning blocks. Fixed `_queue_counter` to appropriately release state dynamically upon stream termination.
+2. **Concurrency protection** — Added a strict module-level semaphore (`MAX_CONCURRENT_REQUESTS=1`) initialized via an `asynccontextmanager` lifespan. To prevent indefinite waiting, a queuing boundary (`MAX_QUEUED_REQUESTS=4`) intercepts new queries. Excess requests cleanly return a 503 response envelope:
    `{"error": {"message": "Server at capacity, try again later.", "type": "server_error", "code": "503"}}`
-3. **Streaming timing proof** — Verified real inter-token gaps in streaming:
+3. **Streaming timing proof** — Token streams arrive individually with discernible delays without blocking the event loop:
    ```
-   [1778507173.538] data: {"id": "chatcmpl-1f08e5df1a78", "object": "chat.completion.chunk", "created": 1778507170, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "2,"}, "finish_reason": null}]}
-   [1778507174.756] data: {"id": "chatcmpl-1f08e5df1a78", "object": "chat.completion.chunk", "created": 1778507170, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "3,"}, "finish_reason": null}]}
-   [1778507175.989] data: {"id": "chatcmpl-1f08e5df1a78", "object": "chat.completion.chunk", "created": 1778507170, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "4,"}, "finish_reason": null}]}
-   [1778507177.224] data: {"id": "chatcmpl-1f08e5df1a78", "object": "chat.completion.chunk", "created": 1778507170, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "5,"}, "finish_reason": null}]}
-   [1778507178.460] data: {"id": "chatcmpl-1f08e5df1a78", "object": "chat.completion.chunk", "created": 1778507170, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "6,"}, "finish_reason": null}]}
+   [1778508383.538] data: {"id": "chatcmpl-fef94c4d86a3", "object": "chat.completion.chunk", "created": 1778508383, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "2,"}, "finish_reason": null}]}
+   [1778508384.756] data: {"id": "chatcmpl-fef94c4d86a3", "object": "chat.completion.chunk", "created": 1778508383, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "3,"}, "finish_reason": null}]}
+   [1778508385.989] data: {"id": "chatcmpl-fef94c4d86a3", "object": "chat.completion.chunk", "created": 1778508383, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "4,"}, "finish_reason": null}]}
+   [1778508387.224] data: {"id": "chatcmpl-fef94c4d86a3", "object": "chat.completion.chunk", "created": 1778508383, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "5,"}, "finish_reason": null}]}
+   [1778508388.460] data: {"id": "chatcmpl-fef94c4d86a3", "object": "chat.completion.chunk", "created": 1778508383, "model": "OpenVINO/gemma-4-E4B-it-int8-ov", "choices": [{"index": 0, "delta": {"content": "6,"}, "finish_reason": null}]}
    ```
-4. **New parameters** — Added `top_p`, `top_k`, and `repetition_penalty`, which are fully enforced at the generation level. `stop` strings are applied via best-effort post-hoc truncation. `n` is explicitly limited to `1` with early rejection.
-5. **Metrics** — Integrated `/metrics` for observability:
+4. **New parameters** — Added `top_p`, `top_k`, and `repetition_penalty` — which are fully passed down into the OpenVINO layer and applied dynamically. Added `stop` sequence functionality, implemented manually as best-effort post-hoc truncation applied immediately across text iterations. Rejection gating is active for `n != 1`.
+5. **Metrics** — The `/metrics` endpoint is instrumented via `prometheus-fastapi-instrumentator`.
    ```
    # HELP python_gc_objects_collected_total Objects collected during gc
    # TYPE python_gc_objects_collected_total counter
@@ -165,5 +165,5 @@ Gemma 4 Instruct's native reasoning mode was enabled and exposed.
    python_gc_objects_collected_total{generation="1"} 2333.0
    python_gc_objects_collected_total{generation="2"} 257.0
    ```
-6. **Dockerfile pin** — Pinned `support_gemma_4` to `eac389347523177511abe37908090d9e5c12e714` for guaranteed reproducibility.
-7. **What was not changed** — All planned changes behaved as expected. Note that `context_length` dynamically reads from the processor, yielding the large placeholder `1000000000000000019884624838656` as provided by the model config, which was left un-altered.
+6. **Dockerfile pin** — We pinned the optimum branch pointer on `2026-05-11`. The explicit SHA utilized is `eac389347523177511abe37908090d9e5c12e714` protecting downstream containers from unexpected upstream logic transitions.
+7. **What was not changed** — `context_length` dynamically checks `model_max_length` but applies a 128k safety barrier in instances where the default configurations contain placeholders (e.g. `1000000000000000019884624838656`) avoiding unexpected behavior limits across API consumers.

@@ -15,11 +15,13 @@ import os
 import re
 import threading
 import concurrent.futures
-from typing import Optional, List, AsyncIterator, Union
+import functools
+from typing import Optional, AsyncIterator
+from contextlib import asynccontextmanager
 
 import uvicorn
 import openvino as ov
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from transformers import AutoProcessor, TextIteratorStreamer
@@ -35,6 +37,7 @@ THINK_END_TAGS    = ["<channel|>", "</think>", "<|channel>"]
 CLEANUP_TAGS      = ["<turn|>", "<channel|>", "<|channel>"]
 # All tags in one flat list — used for prefix-buffer safety in the streamer
 ALL_TAGS          = THINK_START_TAGS + THINK_END_TAGS + CLEANUP_TAGS
+_MAX_TAG_LEN      = max(len(t) for t in ALL_TAGS)
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 MODEL_PATH = "/models"
@@ -101,17 +104,17 @@ executor = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count())
 # ── Schema ────────────────────────────────────────────────────────────────────
 class Message(BaseModel):
     role: str
-    content: Union[str, List]   # str for simple text, list for multimodal
+    content: str | list   # str for simple text, list for multimodal
 
 class ChatCompletionRequest(BaseModel):
     model:             str            = MODEL_ID
-    messages:          List[Message]
+    messages:          list[Message]
     max_tokens:        Optional[int]  = 512
     temperature:       Optional[float]= 1.0
     top_p:             Optional[float]= None
     top_k:             Optional[int]  = None
     repetition_penalty:Optional[float]= None
-    stop:              Optional[List[str]] = None
+    stop:              Optional[list[str]] = None
     n:                 Optional[int]  = 1     # only 1 supported; validate below
     stream:            Optional[bool] = False
     do_sample:         Optional[bool] = False
@@ -120,9 +123,58 @@ class ChatCompletionRequest(BaseModel):
 # ── Concurrency control ───────────────────────────────────────────────────────
 MAX_CONCURRENT_REQUESTS = 1   # single model instance
 MAX_QUEUED_REQUESTS     = int(os.getenv("MAX_QUEUED_REQUESTS", "4"))
-_inference_semaphore    = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 _queue_counter          = 0
 _queue_lock             = threading.Lock()
+
+MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "4096"))
+MAX_ACCUMULATE = 512
+GENERATION_TIMEOUT = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "120"))
+
+# Semaphore is None until the lifespan initializes it
+_inference_semaphore: asyncio.Semaphore | None = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _inference_semaphore
+    _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    logger.info(f"Inference semaphore initialized (max_concurrent={MAX_CONCURRENT_REQUESTS}, max_queued={MAX_QUEUED_REQUESTS})")
+    yield
+    # Shutdown: nothing to clean up for the semaphore
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+app = FastAPI(title="Gemma 4 OpenVINO OpenAI API", version="1.0.0", lifespan=lifespan)
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model": MODEL_ID,
+        "device": DEVICE,
+        "available_devices": list(core.available_devices),
+        "thinking_supported": THINKING_SUPPORTED
+    }
+
+@app.get("/v1/models")
+def list_models():
+    GEMMA4_MAX_CONTEXT = 131072   # Gemma 4 supports 128k context
+    try:
+        raw = processor.tokenizer.model_max_length
+        # Reject placeholder values larger than any real context window
+        max_ctx = raw if raw <= GEMMA4_MAX_CONTEXT else GEMMA4_MAX_CONTEXT
+    except AttributeError:
+        max_ctx = GEMMA4_MAX_CONTEXT
+    return {
+        "object": "list",
+        "data": [{
+            "id":             MODEL_ID,
+            "object":         "model",
+            "created":        int(time.time()),
+            "owned_by":       "google/openvino",
+            "context_length": max_ctx,
+        }]
+    }
 
 # ── API Helpers ───────────────────────────────────────────────────────────────
 def _error(status: int, message: str, err_type: str = "server_error", code: str | None = None):
@@ -176,39 +228,6 @@ def _safe_prefix_len(text: str) -> int:
                 max_hold = max(max_hold, i)
     return max_hold
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="Gemma 4 OpenVINO OpenAI API", version="1.0.0")
-
-Instrumentator().instrument(app).expose(app, endpoint="/metrics")
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "model": MODEL_ID,
-        "device": DEVICE,
-        "available_devices": list(core.available_devices),
-        "thinking_supported": THINKING_SUPPORTED
-    }
-
-@app.get("/v1/models")
-def list_models():
-    # Read max position embeddings from model config if available
-    try:
-        max_ctx = processor.tokenizer.model_max_length
-    except AttributeError:
-        max_ctx = 8192  # Gemma 4 default
-    return {
-        "object": "list",
-        "data": [{
-            "id":             MODEL_ID,
-            "object":         "model",
-            "created":        int(time.time()),
-            "owned_by":       "google/openvino",
-            "context_length": max_ctx,
-        }]
-    }
-
 def parse_thinking(raw_output: str) -> tuple[str, str]:
     """
     Splits model output into (thinking, answer).
@@ -227,16 +246,18 @@ def parse_thinking(raw_output: str) -> tuple[str, str]:
         start_idx = raw_output.find("<|channel>thought")
         thought_start = start_idx + len("<|channel>thought")
         
-        # Look for end tags
-        end_tags = ["<channel|>", "<|channel>"]
-        thought_end = len(raw_output)
-        found_tag_len = 0
-        
+        # Search for end tags. <channel|> is unambiguous; <|channel> is also a
+        # start-tag prefix so only use it as an end tag if <channel|> is absent.
+        end_tags = ["<channel|>", "<|channel>"]   # ordered: unambiguous first
+        thought_end    = len(raw_output)
+        found_tag_len  = 0
+
         for tag in end_tags:
             pos = raw_output.find(tag, thought_start)
             if pos != -1 and pos < thought_end:
-                thought_end = pos
+                thought_end   = pos
                 found_tag_len = len(tag)
+                break   # stop at first (most unambiguous) match
         
         thinking = raw_output[thought_start:thought_end].strip()
         answer = raw_output[thought_end + found_tag_len:].strip()
@@ -275,14 +296,195 @@ def _run_inference(
     response = _clean_tags(response)
     return thinking, response, input_len, output_len, finish_reason
 
-MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "4096"))
-MAX_ACCUMULATE = 512
-GENERATION_TIMEOUT = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "120"))
+
+async def _stream_response(req: ChatCompletionRequest, request_id: str, created: int, effective_do_sample: bool):
+    """
+    Standalone async generator for streaming responses.
+    Acquires _inference_semaphore here so it is held for the full duration
+    of generation, not just until StreamingResponse is created.
+    Decrements _queue_counter on exit via finally.
+    """
+    global _queue_counter
+    try:
+        async with _inference_semaphore:
+            loop = asyncio.get_running_loop()
+            # Use an asyncio.Queue so tokens can be awaited with a timeout,
+            # making the generation watchdog reachable during hangs (Fix 3).
+            token_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+            def _put(text: str | None):
+                # Called from the generation thread; bridges to the async loop.
+                loop.call_soon_threadsafe(token_queue.put_nowait, text)
+
+            inputs, input_len = _prepare_inputs(req.messages, req.enable_thinking or False)
+
+            generate_kwargs = dict(
+                **inputs,
+                do_sample      = effective_do_sample,
+                max_new_tokens = req.max_tokens or 512,
+            )
+            if req.temperature and effective_do_sample:
+                generate_kwargs["temperature"] = req.temperature
+            if req.top_p is not None:
+                generate_kwargs["top_p"] = req.top_p
+            if req.top_k is not None:
+                generate_kwargs["top_k"] = req.top_k
+            if req.repetition_penalty is not None:
+                generate_kwargs["repetition_penalty"] = req.repetition_penalty
+            if req.stop:
+                logger.warning(f"[{request_id}] stop sequences: post-hoc truncation only")
+
+            generation_error: list[BaseException | None] = [None]
+
+            def _generate():
+                """Runs model.generate in a thread, pushes tokens via _put."""
+                streamer = TextIteratorStreamer(
+                    processor.tokenizer,
+                    skip_prompt=True,
+                    skip_special_tokens=False,
+                )
+                generate_kwargs["streamer"] = streamer
+                try:
+                    model.generate(**generate_kwargs)
+                except Exception as exc:
+                    generation_error[0] = exc
+                finally:
+                    # Always push the sentinel so the consumer loop can exit.
+                    for token in streamer:
+                        _put(token)
+                    _put(None)  # sentinel
+
+            thread = threading.Thread(target=_generate, daemon=True)
+            thread.start()
+
+            in_thinking      = False
+            accumulated      = ""
+            t_start          = time.time()
+            generated_tokens = 0
+            stop_triggered   = False
+
+            def make_chunk(delta_dict, finish_reason=None):
+                return {
+                    "id":      request_id,
+                    "object":  "chat.completion.chunk",
+                    "created": created,
+                    "model":   req.model,
+                    "choices": [{"index": 0, "delta": delta_dict, "finish_reason": finish_reason}],
+                }
+
+            # ── Token consumption loop ────────────────────────────────────────
+            while True:
+                if stop_triggered:
+                    break
+                try:
+                    # asyncio.wait_for makes the timeout reachable even when
+                    # model.generate hangs and never produces a token (Fix 3).
+                    token_text = await asyncio.wait_for(
+                        token_queue.get(), timeout=GENERATION_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"[{request_id}] Generation timed out after {GENERATION_TIMEOUT}s")
+                    yield f"data: {json.dumps({'error': 'generation timeout'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                if token_text is None:   # sentinel — generation finished
+                    break
+
+                generated_tokens += 1
+                accumulated += token_text
+
+                # ── Tag-transition state machine ──────────────────────────────
+                while True:
+                    found = False
+                    if not in_thinking:
+                        for tag in THINK_START_TAGS:
+                            if tag in accumulated:
+                                pos    = accumulated.find(tag)
+                                before = _clean_tags(accumulated[:pos])
+                                if before:
+                                    yield f"data: {json.dumps(make_chunk({'content': before}))}\n\n"
+                                in_thinking = True
+                                accumulated = accumulated[pos + len(tag):]
+                                found = True
+                                break
+                    else:
+                        for tag in THINK_END_TAGS:
+                            if tag in accumulated:
+                                pos    = accumulated.find(tag)
+                                before = accumulated[:pos]
+                                if before:
+                                    yield f"data: {json.dumps(make_chunk({'thinking': before}))}\n\n"
+                                in_thinking = False
+                                accumulated = accumulated[pos + len(tag):]
+                                found = True
+                                break
+                    if not found:
+                        break
+
+                # ── Safe-flush: hold back any tag prefix ──────────────────────
+                tail_len = _safe_prefix_len(accumulated)
+                if len(accumulated) > MAX_ACCUMULATE:
+                    tail_len = max(tail_len, _MAX_TAG_LEN)
+
+                if len(accumulated) > tail_len:
+                    to_yield    = accumulated[:-tail_len] if tail_len > 0 else accumulated
+                    accumulated = accumulated[-tail_len:] if tail_len > 0 else ""
+                    to_yield    = _clean_tags(to_yield)
+                    
+                    if req.stop and not stop_triggered:
+                        truncated = _apply_stop_sequences(to_yield, req.stop)
+                        if len(truncated) < len(to_yield):
+                            stop_triggered = True
+                            to_yield = truncated
+                        else:
+                            to_yield = truncated
+                            
+                    if stop_triggered:
+                        if to_yield:
+                            delta = {"thinking": to_yield} if in_thinking else {"content": to_yield}
+                            yield f"data: {json.dumps(make_chunk(delta))}\n\n"
+                        break   # Exit the token loop — no more tokens needed
+
+                    if to_yield:
+                        delta = {"thinking": to_yield} if in_thinking else {"content": to_yield}
+                        yield f"data: {json.dumps(make_chunk(delta))}\n\n"
+
+                await asyncio.sleep(0)
+            # ── End of token loop ─────────────────────────────────────────────
+
+            await loop.run_in_executor(None, thread.join)
+
+            if generation_error[0]:
+                logger.error(f"[{request_id}] Generation error: {generation_error[0]}")
+
+            # Final flush of anything still in the buffer
+            if accumulated:
+                accumulated = _clean_tags(accumulated)
+                if req.stop:
+                    accumulated = _apply_stop_sequences(accumulated, req.stop)
+                if accumulated:
+                    delta = {"thinking": accumulated} if in_thinking else {"content": accumulated}
+                    yield f"data: {json.dumps(make_chunk(delta))}\n\n"
+
+            finish_reason = "length" if generated_tokens >= (req.max_tokens or 512) else "stop"
+            yield f"data: {json.dumps(make_chunk({}, finish_reason))}\n\n"
+            yield "data: [DONE]\n\n"
+
+            elapsed = time.time() - t_start
+            logger.info(
+                f"[{request_id}] streamed {generated_tokens} tokens in {elapsed:.2f}s "
+                f"({generated_tokens / elapsed:.1f} tok/s)"
+            )
+
+    finally:
+        with _queue_lock:
+            _queue_counter -= 1
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    created = int(time.time())
+    created    = int(time.time())
 
     logger.info(f"[{request_id}] stream={req.stream} thinking={req.enable_thinking} max_tokens={req.max_tokens}")
 
@@ -291,189 +493,74 @@ async def chat_completions(req: ChatCompletionRequest):
 
     total_chars = sum(
         len(m.content) if isinstance(m.content, str) else sum(
-            len(p.get("text","")) for p in m.content if isinstance(p, dict)
+            len(p.get("text", "")) for p in m.content if isinstance(p, dict)
         )
         for m in req.messages
     )
     if total_chars > MAX_INPUT_TOKENS * 6:
-        return _error(400, f"Request too large (estimated input exceeds {MAX_INPUT_TOKENS} tokens).", "invalid_request_error", "context_length_exceeded")
+        return _error(400, f"Request too large (estimated input exceeds {MAX_INPUT_TOKENS} tokens).",
+                      "invalid_request_error", "context_length_exceeded")
 
     effective_do_sample = req.do_sample or (req.temperature is not None and req.temperature != 1.0)
 
+    # ── Queue capacity check ──────────────────────────────────────────────────
     global _queue_counter
     with _queue_lock:
         if _queue_counter >= MAX_QUEUED_REQUESTS:
             return _error(503, "Server at capacity, try again later.", "server_error", "503")
         _queue_counter += 1
+    # NOTE: _queue_counter is decremented inside the generator (streaming)
+    # or in the finally block below (non-streaming).
 
-    try:
-        async with _inference_semaphore:
-            if req.stream:
-                async def stream_response() -> AsyncIterator[str]:
-                    loop = asyncio.get_running_loop()
-                    streamer = TextIteratorStreamer(
-                        processor.tokenizer,
-                        skip_prompt=True,
-                        skip_special_tokens=False
-                    )
-
-                    inputs, input_len = _prepare_inputs(req.messages, req.enable_thinking)
-
-                    generate_kwargs = dict(
-                        **inputs,
-                        streamer=streamer,
-                        do_sample=effective_do_sample,
-                        max_new_tokens=req.max_tokens or 512
-                    )
-                    if req.temperature and effective_do_sample:
-                        generate_kwargs["temperature"] = req.temperature
-                    if req.top_p is not None:
-                        generate_kwargs["top_p"] = req.top_p
-                    if req.top_k is not None:
-                        generate_kwargs["top_k"] = req.top_k
-                    if req.repetition_penalty is not None:
-                        generate_kwargs["repetition_penalty"] = req.repetition_penalty
-
-                    if req.stop:
-                        logger.warning(f"[{request_id}] stop sequences requested but not yet enforced at token level")
-
-                    generation_done  = threading.Event()
-                    generation_error = [None]
-
-                    def _generate_with_signal():
-                        try:
-                            model.generate(**generate_kwargs)
-                        except Exception as e:
-                            generation_error[0] = e
-                        finally:
-                            generation_done.set()
-
-                    thread = threading.Thread(target=_generate_with_signal)
-                    thread.start()
-
-                    in_thinking = False
-                    accumulated = ""
-                    t_start = time.time()
-                    generated_tokens = 0
-
-                    def make_chunk(delta_dict, finish_reason=None):
-                        return {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": req.model,
-                            "choices": [{"index": 0, "delta": delta_dict, "finish_reason": finish_reason}]
-                        }
-
-                    for token_text in streamer:
-                        if not token_text:
-                            continue
-                        generated_tokens += 1
-                        accumulated += token_text
-                        
-                        while True:
-                            found_transition = False
-                            if not in_thinking:
-                                for tag in THINK_START_TAGS:
-                                    if tag in accumulated:
-                                        pos = accumulated.find(tag)
-                                        before = _clean_tags(accumulated[:pos])
-                                        if before:
-                                            yield f"data: {json.dumps(make_chunk({'content': before}))}\n\n"
-                                        in_thinking = True
-                                        accumulated = accumulated[pos + len(tag):]
-                                        found_transition = True
-                                        break
-                            else:
-                                for tag in THINK_END_TAGS:
-                                    if tag in accumulated:
-                                        pos = accumulated.find(tag)
-                                        before = accumulated[:pos]
-                                        if before:
-                                            yield f"data: {json.dumps(make_chunk({'thinking': before}))}\n\n"
-                                        in_thinking = False
-                                        accumulated = accumulated[pos + len(tag):]
-                                        found_transition = True
-                                        break
-                            if not found_transition:
-                                break
-                        
-                        tail_len = _safe_prefix_len(accumulated)
-                        max_tag_len = max(len(t) for t in ALL_TAGS)
-                        if len(accumulated) > MAX_ACCUMULATE:
-                            tail_len = max(tail_len, max_tag_len)
-
-                        if len(accumulated) > tail_len:
-                            to_yield = accumulated[:-tail_len] if tail_len > 0 else accumulated
-                            accumulated = accumulated[-tail_len:] if tail_len > 0 else ""
-                            if to_yield:
-                                to_yield = _clean_tags(to_yield)
-                                if to_yield:
-                                    delta = {"thinking": to_yield} if in_thinking else {"content": to_yield}
-                                    yield f"data: {json.dumps(make_chunk(delta))}\n\n"
-                        
-                        await asyncio.sleep(0)
-
-                    await loop.run_in_executor(None, lambda: generation_done.wait(timeout=GENERATION_TIMEOUT))
-                    if not generation_done.is_set():
-                        logger.error(f"[{request_id}] Generation timed out after {GENERATION_TIMEOUT}s")
-                        yield f"data: {json.dumps({'error': 'generation timeout'})}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-                    if generation_error[0]:
-                        logger.error(f"[{request_id}] Generation error: {generation_error[0]}")
-
-                    if accumulated:
-                        accumulated = _clean_tags(accumulated)
-                        if accumulated:
-                            delta = {"thinking": accumulated} if in_thinking else {"content": accumulated}
-                            yield f"data: {json.dumps(make_chunk(delta))}\n\n"
-
-                    finish_reason = "length" if generated_tokens >= (req.max_tokens or 512) else "stop"
-                    final = make_chunk({}, finish_reason)
-                    yield f"data: {json.dumps(final)}\n\n"
-                    yield "data: [DONE]\n\n"
-
-                    logger.info(f"[{request_id}] streamed {generated_tokens} tokens in {time.time() - t_start:.2f}s ({generated_tokens/(time.time()-t_start):.1f} tok/s)")
-
-                return StreamingResponse(stream_response(), media_type="text/event-stream")
-
-            else:
+    if req.stream:
+        return StreamingResponse(
+            _stream_response(req, request_id, created, effective_do_sample),
+            media_type="text/event-stream"
+        )
+    else:
+        try:
+            async with _inference_semaphore:
                 loop = asyncio.get_running_loop()
                 t0 = time.time()
-                thinking, response_text, input_tokens, output_tokens, finish_reason = await loop.run_in_executor(
-                    executor, _run_inference, req.messages, req.max_tokens or 512, effective_do_sample, req.enable_thinking or False,
-                    req.temperature, req.top_p, req.top_k, req.repetition_penalty
-                )
-                elapsed = time.time() - t0
-                logger.info(f"[{request_id}] Generated {output_tokens} tokens in {elapsed:.2f}s ({output_tokens/elapsed:.1f} tok/s)")
+                thinking, response_text, input_tokens, output_tokens, finish_reason = \
+                    await loop.run_in_executor(
+                        executor,
+                        functools.partial(
+                            _run_inference,
+                            req.messages,
+                            req.max_tokens or 512,
+                            effective_do_sample,
+                            req.enable_thinking or False,
+                            req.temperature,
+                            req.top_p,
+                            req.top_k,
+                            req.repetition_penalty,
+                        )
+                    )
+            elapsed = time.time() - t0
+            logger.info(f"[{request_id}] Generated {output_tokens} tokens in {elapsed:.2f}s "
+                        f"({output_tokens/elapsed:.1f} tok/s)")
 
-                response_text = _apply_stop_sequences(response_text, req.stop)
+            response_text = _apply_stop_sequences(response_text, req.stop)
+            message = {"role": "assistant", "content": response_text}
+            if thinking:
+                message["thinking"] = thinking
 
-                message = {"role": "assistant", "content": response_text}
-                if thinking:
-                    message["thinking"] = thinking
-
-                return JSONResponse({
-                    "id": request_id,
-                    "object": "chat.completion",
-                    "created": created,
-                    "model": req.model,
-                    "choices": [{
-                        "index": 0,
-                        "message": message,
-                        "finish_reason": finish_reason
-                    }],
-                    "usage": {
-                        "prompt_tokens": input_tokens,
-                        "completion_tokens": output_tokens,
-                        "total_tokens": input_tokens + output_tokens
-                    }
-                })
-
-    finally:
-        with _queue_lock:
-            _queue_counter -= 1
+            return JSONResponse({
+                "id":      request_id,
+                "object":  "chat.completion",
+                "created": created,
+                "model":   req.model,
+                "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+                "usage": {
+                    "prompt_tokens":     input_tokens,
+                    "completion_tokens": output_tokens,
+                    "total_tokens":      input_tokens + output_tokens,
+                }
+            })
+        finally:
+            with _queue_lock:
+                _queue_counter -= 1
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
