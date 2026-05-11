@@ -195,7 +195,7 @@ def _apply_stop_sequences(text: str, stop: list[str] | None) -> str:
 def _clean_tags(text: str) -> str:
     for tag in CLEANUP_TAGS:
         text = text.replace(tag, "")
-    return text.strip()
+    return text
 
 def _prepare_inputs(messages: list, enable_thinking: bool) -> tuple:
     """
@@ -406,6 +406,7 @@ async def _stream_response(req: ChatCompletionRequest, request_id: str, created:
                                     yield f"data: {json.dumps(make_chunk({'content': before}))}\n\n"
                                 in_thinking = True
                                 accumulated = accumulated[pos + len(tag):]
+                                yield "data: " + json.dumps(make_chunk({'content': '<think>\n'})) + "\n\n"
                                 found = True
                                 break
                     else:
@@ -414,9 +415,10 @@ async def _stream_response(req: ChatCompletionRequest, request_id: str, created:
                                 pos    = accumulated.find(tag)
                                 before = accumulated[:pos]
                                 if before:
-                                    yield f"data: {json.dumps(make_chunk({'thinking': before}))}\n\n"
+                                    yield f"data: {json.dumps(make_chunk({'content': before}))}\n\n"
                                 in_thinking = False
                                 accumulated = accumulated[pos + len(tag):]
+                                yield "data: " + json.dumps(make_chunk({'content': '\n</think>\n\n'})) + "\n\n"
                                 found = True
                                 break
                     if not found:
@@ -442,13 +444,11 @@ async def _stream_response(req: ChatCompletionRequest, request_id: str, created:
                             
                     if stop_triggered:
                         if to_yield:
-                            delta = {"thinking": to_yield} if in_thinking else {"content": to_yield}
-                            yield f"data: {json.dumps(make_chunk(delta))}\n\n"
+                            yield f"data: {json.dumps(make_chunk({'content': to_yield}))}\n\n"
                         break   # Exit the token loop — no more tokens needed
 
                     if to_yield:
-                        delta = {"thinking": to_yield} if in_thinking else {"content": to_yield}
-                        yield f"data: {json.dumps(make_chunk(delta))}\n\n"
+                        yield f"data: {json.dumps(make_chunk({'content': to_yield}))}\n\n"
 
                 await asyncio.sleep(0)
             # ── End of token loop ─────────────────────────────────────────────
@@ -464,8 +464,7 @@ async def _stream_response(req: ChatCompletionRequest, request_id: str, created:
                 if req.stop:
                     accumulated = _apply_stop_sequences(accumulated, req.stop)
                 if accumulated:
-                    delta = {"thinking": accumulated} if in_thinking else {"content": accumulated}
-                    yield f"data: {json.dumps(make_chunk(delta))}\n\n"
+                    yield f"data: {json.dumps(make_chunk({'content': accumulated}))}\n\n"
 
             finish_reason = "length" if generated_tokens >= (req.max_tokens or 512) else "stop"
             yield f"data: {json.dumps(make_chunk({}, finish_reason))}\n\n"
@@ -542,9 +541,11 @@ async def chat_completions(req: ChatCompletionRequest):
                         f"({output_tokens/elapsed:.1f} tok/s)")
 
             response_text = _apply_stop_sequences(response_text, req.stop)
-            message = {"role": "assistant", "content": response_text}
+            
             if thinking:
-                message["thinking"] = thinking
+                response_text = f"<think>\n{thinking}\n</think>\n\n{response_text}"
+            
+            message = {"role": "assistant", "content": response_text.strip()}
 
             return JSONResponse({
                 "id":      request_id,
