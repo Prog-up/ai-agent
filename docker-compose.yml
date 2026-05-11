@@ -14,7 +14,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 48g
+          memory: 64g
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
