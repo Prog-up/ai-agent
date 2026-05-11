@@ -1,6 +1,6 @@
 services:
   ovms:
-    image: openvino/model_server:weekly
+    image: openvino/model_server:latest
     # Maps to --user $(id -u):$(id -g). 
     # Uses 1000 as a fallback if the variables aren't set in your environment.
     user: "${UID:-1000}:${GID:-1000}"
