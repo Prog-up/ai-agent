@@ -64,6 +64,30 @@ curl -s http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+### Thinking / Reasoning Mode
+
+Pass `"enable_thinking": true` in the request body to activate the model's
+reasoning step. When enabled, the model's internal chain of thought is included
+in the response wrapped in `<think>...</think>` tags, prepended to the final
+answer inside the standard `content` field.
+
+**Non-streaming example response `content`:**
+```
+<think>
+The user is asking about X. Let me reason through...
+</think>
+
+The answer is Y.
+```
+
+**Streaming:** thinking tokens are streamed inline as `delta.content` chunks,
+starting with a `<think>\n` chunk and ending with `\n</think>\n\n` before the
+answer begins. Clients that render `<think>` blocks (OpenWebUI, etc.) will
+display the reasoning step automatically.
+
+The `enable_thinking` field is silently ignored if `THINKING_SUPPORTED` is
+`false` at startup (probe result logged on container start).
+
 ## Benchmark Results
 
 | Test Case | Latency | Input Tokens | Output Tokens | Throughput |
@@ -95,7 +119,7 @@ Implemented true token streaming using the `transformers.TextIteratorStreamer` c
 Gemma 4 Instruct's native reasoning mode was enabled and exposed.
 - **Activation:** Passing `enable_thinking=True` to `apply_chat_template` inserts the `<|think|>` token into the system prompt.
 - **Parsing:** Added a robust `parse_thinking` function that identifies the `<|channel>thought` start tag and the `<channel|>` end tag.
-- **API Surface:** Thinking blocks are surfaced via a dedicated `thinking` field in non-streaming responses and `delta.thinking` in streaming chunks.
+- **API Surface:** Thinking blocks are embedded in the `content` field wrapped in `<think>...</think>` tags for both streaming and non-streaming responses.
 
 ### GPU Detection & Precision
 - **Auto-detection:** Added logic using `openvino.Core().available_devices` to automatically target `GPU` if available, falling back to `CPU`.
@@ -167,3 +191,66 @@ Gemma 4 Instruct's native reasoning mode was enabled and exposed.
    ```
 6. **Dockerfile pin** — We pinned the optimum branch pointer on `2026-05-11`. The explicit SHA utilized is `eac389347523177511abe37908090d9e5c12e714` protecting downstream containers from unexpected upstream logic transitions.
 7. **What was not changed** — `context_length` dynamically checks `model_max_length` but applies a 128k safety barrier in instances where the default configurations contain placeholders (e.g. `1000000000000000019884624838656`) avoiding unexpected behavior limits across API consumers.
+
+## Hermes CLI Compatibility
+
+1. **Configuration**
+   The following configuration block works natively with Hermes using the `custom` provider.
+   ```yaml
+   # ~/.hermes/config.yaml
+   default_provider: local-ovms
+   default_model: "OpenVINO/gemma-4-E4B-it-int8-ov"
+
+   providers:
+     local-ovms:
+       type: openai_compatible
+       base_url: "http://localhost:8000/v1"
+       api_key: "not-needed"
+       models:
+         - id: "OpenVINO/gemma-4-E4B-it-int8-ov"
+           context_length: 131072
+
+   display:
+     show_cost: false
+
+   auxiliary:
+     compression:
+       model: "OpenVINO/gemma-4-E4B-it-int8-ov"
+   ```
+
+2. **Feature compatibility table**
+
+| Feature | Status | Notes |
+|---|---|---|
+| Single query (`-q`) | ✅ | Fully operational |
+| Streaming | ✅ | Timings verified; progressive token delivery |
+| Token count in status bar | ✅ | Supported via `stream_options.include_usage` |
+| `/reasoning high` (thinking) | ✅ | Triggers `<think>` block generation |
+| `/personality` | ✅ | Supported |
+| Multi-turn context | ✅ | Supported |
+| `/usage` | ✅ | Usage stats successfully report |
+| Session resume (`-c`, `-r`) | ✅ | Operational |
+| `/background` | ✅ | Background tasks successfully return |
+| Image input (vision) | ✅ | Data URI base64 images properly decoded |
+| `/compress` | ✅ | Context compression fully operational |
+
+3. **Server.py changes made**
+   - Mapped `reasoning_effort="high"` to trigger `enable_thinking=True` for reasoning support.
+   - Added `_decode_image_url` helper in `_prepare_inputs` to intercept `image_url` payloads (data URI format) and seamlessly convert them into PIL format for OpenVINO inputs.
+   - Set `model_config = ConfigDict(extra='ignore')` inside Pydantic schemas (e.g. `ChatCompletionRequest`) to prevent standard Hermes client headers (`presence_penalty`, `seed`, `user`) from throwing `422 Unprocessable Entity`.
+   - Included `ResponseFormat` schema fallback handler defaulting un-supported payloads to raw text logic.
+   - Verified `/v1/models` strictly outputs `context_length` metric accurately readable by Hermes context boundaries.
+
+4. **Known limitations**
+   - The OpenVINO server triggers a `RuntimeError: Infer Request is busy` if the `gen_thread` does not successfully process early thread disconnects. A rigid `finally` catch prevents the API from totally halting, yet aggressive retries from Hermes can periodically provoke it.
+
+5. **Quick start**
+   ```bash
+   # Add the config locally
+   hermes config set model.provider custom
+   hermes config set model.default OpenVINO/gemma-4-E4B-it-int8-ov
+   hermes config set model.base_url http://localhost:8000/v1
+   
+   # Confirm operational integrity
+   hermes chat -q "Say exactly: OK"
+   ```
