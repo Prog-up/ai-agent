@@ -37,7 +37,7 @@ logger = logging.getLogger("gemma4-server")
 # ── Thinking tag constants ────────────────────────────────────────────────────
 THINK_START_TAGS  = ["<|channel>thought", "<think>"]
 THINK_END_TAGS    = ["<channel|>", "</think>", "<|channel>"]
-CLEANUP_TAGS      = ["<turn|>", "<channel|>", "<|channel>"]
+CLEANUP_TAGS      = ["<turn|>", "<channel|>", "<|channel>", "<end_of_turn>", "<eos>", "<bos>"]
 # All tags in one flat list — used for prefix-buffer safety in the streamer
 ALL_TAGS          = THINK_START_TAGS + THINK_END_TAGS + CLEANUP_TAGS
 _MAX_TAG_LEN      = max(len(t) for t in ALL_TAGS)
@@ -59,6 +59,39 @@ logger.info(f"Model path validated: {MODEL_PATH}")
 
 logger.info("Loading processor...")
 processor = AutoProcessor.from_pretrained(MODEL_PATH)
+
+# ── EOS tokens to strip when decoding with skip_special_tokens=False ─────────
+# These are Gemma-specific tokens that appear as literal strings when
+# skip_special_tokens=False but must not appear in the final response.
+_EOS_STRIP_TOKENS: list[str] = []
+
+def _build_eos_strip_list() -> list[str]:
+    tokens = set()
+    # Always strip the known Gemma turn/eos tokens
+    tokens.update(["<end_of_turn>", "<eos>", "<bos>"])
+    # Also strip whatever the tokenizer reports as eos_token
+    try:
+        tok = getattr(processor, 'tokenizer', processor)
+        if hasattr(tok, 'eos_token') and tok.eos_token:
+            tokens.add(tok.eos_token)
+        if hasattr(tok, 'additional_special_tokens'):
+            for t in tok.additional_special_tokens:
+                # Only strip tokens that look like control tokens, not content
+                if t.startswith('<') and t.endswith('>') and len(t) < 30:
+                    tokens.add(t)
+    except Exception as e:
+        logger.warning(f"Could not build full EOS strip list: {e}")
+    result = sorted(tokens, key=len, reverse=True)  # longest first to avoid partial matches
+    logger.info(f"EOS strip tokens: {result}")
+    return result
+
+_EOS_STRIP_TOKENS = _build_eos_strip_list()
+
+def _strip_eos_tokens(text: str) -> str:
+    """Remove EOS/turn tokens that appear when skip_special_tokens=False."""
+    for token in _EOS_STRIP_TOKENS:
+        text = text.replace(token, "")
+    return text
 
 core = ov.Core()
 devices = core.available_devices
@@ -124,7 +157,7 @@ class ResponseFormat(BaseModel):
     type: Optional[str] = "text"   # "text" | "json_object" | "json_schema"
 
 class ChatCompletionRequest(BaseModel):
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='ignore')
     model:                 str            = MODEL_ID
     messages:              list[Message]
     max_tokens:            Optional[int]  = None
@@ -166,36 +199,6 @@ async def lifespan(app: FastAPI):
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Gemma 4 OpenVINO OpenAI API", version="1.0.0", lifespan=lifespan)
 
-# Debug request logging — enable only when explicitly requested
-if os.getenv("DEBUG_LOG_REQUESTS", "").lower() in ("1", "true", "yes"):
-    @app.middleware("http")
-    async def log_request_body(request, call_next):
-        body = await request.body()
-        if body:
-            try:
-                parsed = json.loads(body)
-                # Truncate image data URIs before logging
-                def _truncate_images(obj):
-                    if isinstance(obj, dict):
-                        return {
-                            k: ("<image_truncated>" if k == "url" and isinstance(v, str) and v.startswith("data:") else _truncate_images(v))
-                            for k, v in obj.items()
-                        }
-                    if isinstance(obj, list):
-                        return [_truncate_images(i) for i in obj]
-                    return obj
-                sanitized = _truncate_images(parsed)
-                logging.getLogger("request-debug").info(
-                    f"REQUEST: {json.dumps(sanitized, indent=2)}"
-                )
-            except Exception:
-                pass
-        async def receive():
-            return {"type": "http.request", "body": body}
-        request._receive = receive
-        return await call_next(request)
-    logger.info("DEBUG_LOG_REQUESTS enabled — request bodies will be logged (images truncated)")
-
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 @app.get("/health")
@@ -210,13 +213,9 @@ def health():
 
 @app.get("/v1/models")
 def list_models():
-    GEMMA4_MAX_CONTEXT = 131072   # Gemma 4 supports 128k context
-    try:
-        raw = processor.tokenizer.model_max_length
-        # Reject placeholder values larger than any real context window
-        max_ctx = raw if raw <= GEMMA4_MAX_CONTEXT else GEMMA4_MAX_CONTEXT
-    except AttributeError:
-        max_ctx = GEMMA4_MAX_CONTEXT
+    # Return MAX_INPUT_TOKENS so clients (like Hermes) compress their context properly
+    # instead of sending 50k tokens which hangs the CPU OpenVINO execution.
+    max_ctx = MAX_INPUT_TOKENS
     return {
         "object": "list",
         "data": [{
@@ -416,6 +415,7 @@ def _run_inference(
     
     # We use skip_special_tokens=False to catch the thinking tags
     raw_response = processor.decode(output[0][input_len:], skip_special_tokens=False)
+    raw_response = _strip_eos_tokens(raw_response)
     
     thinking, response = parse_thinking(raw_response)
     response = _clean_tags(response)
@@ -559,10 +559,7 @@ async def _stream_response(
                         yield "data: [DONE]\n\n"
                         return
                     else:
-                        # Send an empty content chunk as keep-alive instead of SSE comment
-                        yield "data: " + json.dumps(
-                            _make_chunk(request_id, created, req.model, {"content": " "})
-                        ) + "\n\n"
+                        yield ": keep-alive\n\n"
                         continue
 
                 wait_start = time.time() # Reset timeout tracker on token received
@@ -635,6 +632,12 @@ async def _stream_response(
             if generation_error[0]:
                 logger.error(f"[{request_id}] Generation error: {generation_error[0]}")
 
+            if generated_tokens == 0:
+                logger.error(
+                    f"[{request_id}] STREAM ENDED with zero generated tokens. "
+                    f"generation_error: {generation_error[0]}"
+                )
+
             # Final flush of anything still in the buffer
             if accumulated:
                 accumulated = _clean_tags(accumulated)
@@ -685,7 +688,6 @@ async def chat_completions(req: ChatCompletionRequest):
     created    = int(time.time())
 
     logger.info(f"[{request_id}] stream={req.stream} thinking={req.enable_thinking} max_tokens={req.max_tokens}")
-    logger.info(f"[{request_id}] RAW REQ DUMP: {req.model_dump()}")
 
     if req.n and req.n != 1:
         return _error(400, "Only n=1 is supported.", "invalid_request_error", "unsupported_n")
@@ -764,7 +766,17 @@ async def chat_completions(req: ChatCompletionRequest):
             if thinking:
                 response_text = f"<think>\n{thinking}\n</think>\n\n{response_text}"
             
-            message = {"role": "assistant", "content": response_text.strip()}
+            # Guard: log if content is empty so we can diagnose it
+            final_content = response_text.strip()
+            if not final_content:
+                logger.error(
+                    f"[{request_id}] EMPTY CONTENT after processing. "
+                    f"raw thinking present: {bool(thinking)}, "
+                    f"raw response_text before strip: {response_text!r}, "
+                    f"output_tokens: {output_tokens}"
+                )
+
+            message = {"role": "assistant", "content": final_content}
 
             return JSONResponse({
                 "id":               request_id,
