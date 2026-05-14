@@ -254,3 +254,37 @@ Gemma 4 Instruct's native reasoning mode was enabled and exposed.
    # Confirm operational integrity
    hermes chat -q "Say exactly: OK"
    ```
+
+## v1.3 — Hermes Compatibility Fixes
+
+1. **Bugs fixed**
+   - `_decode_image_url`: Hermes sends images as data URIs; the server previously crashed, so we added base64 to PIL decoding.
+   - `reasoning_effort`: Hermes uses this field for `/reasoning high`; we added it to the schema and mapped it to `enable_thinking`.
+   - `ResponseFormat`: Hermes occasionally requests `{"type": "text"}`; added a schema to accept it and warn if JSON mode is asked for.
+   - `ConfigDict extra ignore`: Hermes sends headers like `presence_penalty` and `user`; explicitly ignoring extra fields prevents HTTP 422 errors.
+   - `DEBUG_LOG_REQUESTS`: Debug middleware flooded logs with base64 image data; it is now gated behind an environment variable.
+   - `_model_lock`: The extra lock falsely implied multi-threading protection when the semaphore already guarantees it; it was removed.
+   - `finally: pass`: An empty, useless block wrapping the generator was removed for code cleanliness.
+   - `system_fingerprint` & `max_context_length`: The `/v1/models` endpoint lacked these; we added them for Hermes to accurately gauge token capacity.
+
+2. **Corrected Feature compatibility table**
+
+| Feature | Status | Notes |
+|---|---|---|
+| Single query (`-q`) | ✅ | Fully operational. |
+| Streaming | ✅ | Timings verified; progressive token delivery (no batching). |
+| Token count in status bar | ✅ | Supported via `stream_options.include_usage`. |
+| `/reasoning high` (thinking) | ✅ | Triggers `<think>` block generation natively. |
+| `/personality` | ✅ | Supported. |
+| Multi-turn context | ✅ | Supported. |
+| `/usage` | ✅ | Usage stats successfully reported. |
+| Session resume (`-c`, `-r`) | ✅ | Operational. |
+| `/background` | ✅ | Background tasks successfully return. |
+| Image input (vision) | ✅ | Data URI base64 images properly decoded. |
+| `/compress` | ✅ | Context compression fully operational. |
+
+3. **Image Input Testing**
+   Image input successfully identified the color. Example response: `'The color of the square is blue.'`
+
+4. **Reasoning Mode Testing**
+   `/reasoning high` produced a visible `<think>` block. Example first 50 characters: `<think>\nThe user wants to know the product of 13 `

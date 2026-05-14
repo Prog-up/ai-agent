@@ -8,6 +8,8 @@ Endpoints:
 
 import time
 import uuid
+import base64
+import io
 import json
 import asyncio
 import logging
@@ -19,11 +21,12 @@ import functools
 from typing import Optional, AsyncIterator
 from contextlib import asynccontextmanager
 
+from PIL import Image as PILImage
 import uvicorn
 import openvino as ov
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from transformers import AutoProcessor, TextIteratorStreamer
 from optimum.intel.openvino import OVModelForVisualCausalLM
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -108,13 +111,20 @@ executor = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count())
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 class Message(BaseModel):
+    model_config = ConfigDict(extra='ignore')
     role: str
     content: str | list   # str for simple text, list for multimodal
 
 class StreamOptions(BaseModel):
+    model_config = ConfigDict(extra='ignore')
     include_usage: Optional[bool] = False
 
+class ResponseFormat(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    type: Optional[str] = "text"   # "text" | "json_object" | "json_schema"
+
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra='allow')
     model:                 str            = MODEL_ID
     messages:              list[Message]
     max_tokens:            Optional[int]  = None
@@ -129,17 +139,18 @@ class ChatCompletionRequest(BaseModel):
     stream_options:        Optional[StreamOptions] = None
     do_sample:             Optional[bool] = False
     enable_thinking:       Optional[bool] = False
+    reasoning_effort:      Optional[str]  = None     # OpenAI standard: "low", "medium", "high"
+    response_format:       Optional[ResponseFormat] = None
 
 # ── Concurrency control ───────────────────────────────────────────────────────
 MAX_CONCURRENT_REQUESTS = 1   # single model instance
 MAX_QUEUED_REQUESTS     = int(os.getenv("MAX_QUEUED_REQUESTS", "4"))
 _queue_counter          = 0
 _queue_lock             = threading.Lock()
-_model_lock             = threading.Lock()  # Protects model.generate from asyncio cancellation leaks
 
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "4096"))
 MAX_ACCUMULATE = 512
-GENERATION_TIMEOUT = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "120"))
+GENERATION_TIMEOUT = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "600"))
 
 # Semaphore is None until the lifespan initializes it
 _inference_semaphore: asyncio.Semaphore | None = None
@@ -155,24 +166,35 @@ async def lifespan(app: FastAPI):
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Gemma 4 OpenVINO OpenAI API", version="1.0.0", lifespan=lifespan)
 
-@app.middleware("http")
-async def log_request_body(request, call_next):
-    import json as _json
-    body = await request.body()
-    if body:
-        try:
-            parsed = _json.loads(body)
-            import logging
-            logging.getLogger("hermes-probe").info(
-                f"HERMES REQUEST: {_json.dumps(parsed, indent=2)}"
-            )
-        except Exception:
-            pass
-    # Starlette consumes the body stream, so we must replace it for downstream readers
-    async def receive():
-        return {"type": "http.request", "body": body}
-    request._receive = receive
-    return await call_next(request)
+# Debug request logging — enable only when explicitly requested
+if os.getenv("DEBUG_LOG_REQUESTS", "").lower() in ("1", "true", "yes"):
+    @app.middleware("http")
+    async def log_request_body(request, call_next):
+        body = await request.body()
+        if body:
+            try:
+                parsed = json.loads(body)
+                # Truncate image data URIs before logging
+                def _truncate_images(obj):
+                    if isinstance(obj, dict):
+                        return {
+                            k: ("<image_truncated>" if k == "url" and isinstance(v, str) and v.startswith("data:") else _truncate_images(v))
+                            for k, v in obj.items()
+                        }
+                    if isinstance(obj, list):
+                        return [_truncate_images(i) for i in obj]
+                    return obj
+                sanitized = _truncate_images(parsed)
+                logging.getLogger("request-debug").info(
+                    f"REQUEST: {json.dumps(sanitized, indent=2)}"
+                )
+            except Exception:
+                pass
+        async def receive():
+            return {"type": "http.request", "body": body}
+        request._receive = receive
+        return await call_next(request)
+    logger.info("DEBUG_LOG_REQUESTS enabled — request bodies will be logged (images truncated)")
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
@@ -203,6 +225,8 @@ def list_models():
             "created":        MODEL_CREATED_AT,
             "owned_by":       "google/openvino",
             "context_length": max_ctx,
+            "max_context_length": max_ctx,     # alias used by some clients
+            "system_fingerprint": SYSTEM_FINGERPRINT,
         }]
     }
 
@@ -227,22 +251,71 @@ def _clean_tags(text: str) -> str:
         text = text.replace(tag, "")
     return text
 
+def _decode_image_url(url: str) -> PILImage.Image:
+    """
+    Converts an OpenAI image_url (data URI or http/https URL) to a PIL Image.
+    Supports: data:image/<fmt>;base64,<payload>  and  http(s)://<url>
+    """
+    if url.startswith("data:"):
+        # data:image/png;base64,<payload>
+        header, encoded = url.split(",", 1)
+        image_bytes = base64.b64decode(encoded)
+        return PILImage.open(io.BytesIO(image_bytes))
+    else:
+        import requests as _req
+        response = _req.get(url, timeout=10)
+        response.raise_for_status()
+        return PILImage.open(io.BytesIO(response.content))
+
+
 def _prepare_inputs(messages: list, enable_thinking: bool) -> tuple:
     """
     Converts a list of Message objects into processor inputs.
+    Handles OpenAI image_url format by converting to PIL Images.
     Returns (inputs_dict, input_len).
     """
     formatted = []
     for m in messages:
-        content = m.content if isinstance(m.content, list) else [{"type": "text", "text": m.content}]
+        if isinstance(m.content, list):
+            converted_parts = []
+            for part in m.content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    url = part.get("image_url", {}).get("url", "")
+                    if not url:
+                        logger.warning("image_url part has empty url — skipping")
+                        continue
+                    try:
+                        pil_img = _decode_image_url(url)
+                        converted_parts.append({"type": "image", "image": pil_img})
+                        logger.info(f"Decoded image_url → PIL Image {pil_img.size} {pil_img.mode}")
+                    except Exception as e:
+                        logger.warning(f"Failed to decode image_url: {e} — skipping image")
+                else:
+                    converted_parts.append(part)
+            content = converted_parts
+        else:
+            content = [{"type": "text", "text": m.content}]
         formatted.append({"role": m.role, "content": content})
 
     template_kwargs = {"add_generation_prompt": True, "tokenize": False}
     if THINKING_SUPPORTED and enable_thinking:
         template_kwargs["enable_thinking"] = True
 
-    text   = processor.apply_chat_template(formatted, **template_kwargs)
-    inputs = processor(text=text, return_tensors="pt")
+    text = processor.apply_chat_template(formatted, **template_kwargs)
+
+    # Collect PIL images for the processor call
+    pil_images = [
+        part["image"]
+        for m_dict in formatted
+        for part in (m_dict["content"] if isinstance(m_dict["content"], list) else [])
+        if isinstance(part, dict) and part.get("type") == "image"
+    ]
+
+    if pil_images:
+        inputs = processor(text=text, images=pil_images, return_tensors="pt")
+    else:
+        inputs = processor(text=text, return_tensors="pt")
+
     return inputs, inputs["input_ids"].shape[-1]
 
 def _safe_prefix_len(text: str) -> int:
@@ -337,8 +410,7 @@ def _run_inference(
     if repetition_penalty is not None:
         gen_params["repetition_penalty"] = repetition_penalty
 
-    with _model_lock:
-        output = model.generate(**inputs, **gen_params)
+    output = model.generate(**inputs, **gen_params)
     output_len = output.shape[-1] - input_len
     finish_reason = "length" if output_len >= max_new_tokens else "stop"
     
@@ -350,12 +422,24 @@ def _run_inference(
     return thinking, response, input_len, output_len, finish_reason
 
 
+@asynccontextmanager
+async def _thread_waiter(gen_thread, bridge_thread):
+    try:
+        yield
+    finally:
+        loop = asyncio.get_running_loop()
+        if gen_thread.is_alive():
+            await loop.run_in_executor(None, gen_thread.join)
+        if bridge_thread.is_alive():
+            await loop.run_in_executor(None, bridge_thread.join)
+
 async def _stream_response(
     req: ChatCompletionRequest,
     request_id: str,
     created: int,
     effective_do_sample: bool,
     effective_max_tokens: int,
+    effective_thinking: bool = False,
 ):
     """
     Standalone async generator for streaming responses.
@@ -365,7 +449,15 @@ async def _stream_response(
     """
     global _queue_counter
     try:
-        async with _inference_semaphore:
+        await _inference_semaphore.acquire()
+    except asyncio.CancelledError:
+        with _queue_lock:
+            _queue_counter -= 1
+        raise
+        
+    try:
+        thread_started = False
+        try:
             loop = asyncio.get_running_loop()
             # Use an asyncio.Queue so tokens can be awaited with a timeout,
             # making the generation watchdog reachable during hangs (Fix 3).
@@ -375,7 +467,7 @@ async def _stream_response(
                 # Called from the generation thread; bridges to the async loop.
                 loop.call_soon_threadsafe(token_queue.put_nowait, text)
 
-            inputs, input_len = _prepare_inputs(req.messages, req.enable_thinking or False)
+            inputs, input_len = _prepare_inputs(req.messages, effective_thinking)
 
             generate_kwargs = dict(
                 **inputs,
@@ -405,8 +497,7 @@ async def _stream_response(
             def _generate():
                 """Runs model.generate. Tokens are pushed to streamer's internal queue."""
                 try:
-                    with _model_lock:
-                        model.generate(**generate_kwargs)
+                    model.generate(**generate_kwargs)
                 except Exception as exc:
                     generation_error[0] = exc
                 finally:
@@ -426,8 +517,17 @@ async def _stream_response(
 
             gen_thread    = threading.Thread(target=_generate, daemon=True)
             bridge_thread = threading.Thread(target=_bridge,   daemon=True)
+            
+            def _release_when_done():
+                gen_thread.join()
+                loop.call_soon_threadsafe(_inference_semaphore.release)
+                
+            release_thread = threading.Thread(target=_release_when_done, daemon=True)
+
             gen_thread.start()
+            thread_started = True
             bridge_thread.start()
+            release_thread.start()
 
             # OpenAI spec: first chunk always carries role, with empty content
             yield "data: " + json.dumps(
@@ -440,134 +540,142 @@ async def _stream_response(
             generated_tokens = 0
             stop_triggered   = False
 
-            try:
-                # ── Token consumption loop ────────────────────────────────────────
-                while True:
-                    if stop_triggered:
-                        break
-                    try:
-                        # asyncio.wait_for makes the timeout reachable even when
-                        # model.generate hangs and never produces a token (Fix 3).
-                        token_text = await asyncio.wait_for(
-                            token_queue.get(), timeout=GENERATION_TIMEOUT
-                        )
-                    except asyncio.TimeoutError:
+            # ── Token consumption loop ────────────────────────────────────────
+            wait_start = time.time()
+            while True:
+                if stop_triggered:
+                    break
+                try:
+                    # Wait for 15s max per loop to yield keep-alives to prevent client disconnects
+                    token_text = await asyncio.wait_for(
+                        token_queue.get(), timeout=15.0
+                    )
+                except asyncio.TimeoutError:
+                    if time.time() - wait_start > GENERATION_TIMEOUT:
                         logger.error(f"[{request_id}] Generation timed out after {GENERATION_TIMEOUT}s")
                         yield "data: " + json.dumps(
                             _make_chunk(request_id, created, req.model, {}, finish_reason="error")
                         ) + "\n\n"
                         yield "data: [DONE]\n\n"
                         return
+                    else:
+                        # Send an empty content chunk as keep-alive instead of SSE comment
+                        yield "data: " + json.dumps(
+                            _make_chunk(request_id, created, req.model, {"content": " "})
+                        ) + "\n\n"
+                        continue
 
-                    if token_text is None:   # sentinel — generation finished
+                wait_start = time.time() # Reset timeout tracker on token received
+                
+                if token_text is None:   # sentinel — generation finished
+                    break
+
+                generated_tokens += 1
+                accumulated += token_text
+
+                # ── Tag-transition state machine ──────────────────────────────
+                while True:
+                    found = False
+                    if not in_thinking:
+                        for tag in THINK_START_TAGS:
+                            if tag in accumulated:
+                                pos    = accumulated.find(tag)
+                                before = _clean_tags(accumulated[:pos])
+                                if before:
+                                    yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': before})) + "\n\n"
+                                in_thinking = True
+                                accumulated = accumulated[pos + len(tag):]
+                                yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': '<think>\n'})) + "\n\n"
+                                found = True
+                                break
+                    else:
+                        for tag in THINK_END_TAGS:
+                            if tag in accumulated:
+                                pos    = accumulated.find(tag)
+                                before = accumulated[:pos]
+                                if before:
+                                    yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': before})) + "\n\n"
+                                in_thinking = False
+                                accumulated = accumulated[pos + len(tag):]
+                                yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': '\n</think>\n\n'})) + "\n\n"
+                                found = True
+                                break
+                    if not found:
                         break
 
-                    generated_tokens += 1
-                    accumulated += token_text
+                # ── Safe-flush: hold back any tag prefix ──────────────────────
+                tail_len = _safe_prefix_len(accumulated)
+                if len(accumulated) > MAX_ACCUMULATE:
+                    tail_len = max(tail_len, _MAX_TAG_LEN)
 
-                    # ── Tag-transition state machine ──────────────────────────────
-                    while True:
-                        found = False
-                        if not in_thinking:
-                            for tag in THINK_START_TAGS:
-                                if tag in accumulated:
-                                    pos    = accumulated.find(tag)
-                                    before = _clean_tags(accumulated[:pos])
-                                    if before:
-                                        yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': before})) + "\n\n"
-                                    in_thinking = True
-                                    accumulated = accumulated[pos + len(tag):]
-                                    yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': '<think>\n'})) + "\n\n"
-                                    found = True
-                                    break
+                if len(accumulated) > tail_len:
+                    to_yield    = accumulated[:-tail_len] if tail_len > 0 else accumulated
+                    accumulated = accumulated[-tail_len:] if tail_len > 0 else ""
+                    to_yield    = _clean_tags(to_yield)
+
+                    if req.stop and not stop_triggered:
+                        truncated = _apply_stop_sequences(to_yield, req.stop)
+                        if len(truncated) < len(to_yield):
+                            stop_triggered = True
+                            to_yield = truncated
                         else:
-                            for tag in THINK_END_TAGS:
-                                if tag in accumulated:
-                                    pos    = accumulated.find(tag)
-                                    before = accumulated[:pos]
-                                    if before:
-                                        yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': before})) + "\n\n"
-                                    in_thinking = False
-                                    accumulated = accumulated[pos + len(tag):]
-                                    yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': '\n</think>\n\n'})) + "\n\n"
-                                    found = True
-                                    break
-                        if not found:
-                            break
+                            to_yield = truncated
 
-                    # ── Safe-flush: hold back any tag prefix ──────────────────────
-                    tail_len = _safe_prefix_len(accumulated)
-                    if len(accumulated) > MAX_ACCUMULATE:
-                        tail_len = max(tail_len, _MAX_TAG_LEN)
-
-                    if len(accumulated) > tail_len:
-                        to_yield    = accumulated[:-tail_len] if tail_len > 0 else accumulated
-                        accumulated = accumulated[-tail_len:] if tail_len > 0 else ""
-                        to_yield    = _clean_tags(to_yield)
-                        
-                        if req.stop and not stop_triggered:
-                            truncated = _apply_stop_sequences(to_yield, req.stop)
-                            if len(truncated) < len(to_yield):
-                                stop_triggered = True
-                                to_yield = truncated
-                            else:
-                                to_yield = truncated
-                                
-                        if stop_triggered:
-                            if to_yield:
-                                yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': to_yield})) + "\n\n"
-                            break   # Exit the token loop — no more tokens needed
-
+                    if stop_triggered:
                         if to_yield:
                             yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': to_yield})) + "\n\n"
+                        break   # Exit the token loop — no more tokens needed
 
-                    await asyncio.sleep(0)
-                # ── End of token loop ─────────────────────────────────────────────
+                    if to_yield:
+                        yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': to_yield})) + "\n\n"
 
-                if generation_error[0]:
-                    logger.error(f"[{request_id}] Generation error: {generation_error[0]}")
+                await asyncio.sleep(0)
+            # ── End of token loop ─────────────────────────────────────────────
 
-                # Final flush of anything still in the buffer
+            if generation_error[0]:
+                logger.error(f"[{request_id}] Generation error: {generation_error[0]}")
+
+            # Final flush of anything still in the buffer
+            if accumulated:
+                accumulated = _clean_tags(accumulated)
+                if req.stop:
+                    accumulated = _apply_stop_sequences(accumulated, req.stop)
                 if accumulated:
-                    accumulated = _clean_tags(accumulated)
-                    if req.stop:
-                        accumulated = _apply_stop_sequences(accumulated, req.stop)
-                    if accumulated:
-                        yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': accumulated})) + "\n\n"
+                    yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {'content': accumulated})) + "\n\n"
 
-                finish_reason = "length" if generated_tokens >= effective_max_tokens else "stop"
-                if generation_error[0]:
-                     finish_reason = "error"
-                yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {}, finish_reason)) + "\n\n"
+            finish_reason = "length" if generated_tokens >= effective_max_tokens else "stop"
+            if generation_error[0]:
+                 finish_reason = "error"
+            yield "data: " + json.dumps(_make_chunk(request_id, created, req.model, {}, finish_reason)) + "\n\n"
 
-                # Send usage chunk if requested via stream_options
-                if req.stream_options and req.stream_options.include_usage:
-                    usage_chunk = {
-                        "id":               request_id,
-                        "object":           "chat.completion.chunk",
-                        "created":          created,
-                        "model":            req.model,
-                        "system_fingerprint": SYSTEM_FINGERPRINT,
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens":     input_len,
-                            "completion_tokens": generated_tokens,
-                            "total_tokens":      input_len + generated_tokens,
-                        },
-                    }
-                    yield f"data: {json.dumps(usage_chunk)}\n\n"
-
-                yield "data: [DONE]\n\n"
-
-            finally:
-                pass
+            # Send usage chunk if requested via stream_options
+            if req.stream_options and req.stream_options.include_usage:
+                usage_chunk = {
+                    "id":               request_id,
+                    "object":           "chat.completion.chunk",
+                    "created":          created,
+                    "model":            req.model,
+                    "system_fingerprint": SYSTEM_FINGERPRINT,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens":     input_len,
+                        "completion_tokens": generated_tokens,
+                        "total_tokens":      input_len + generated_tokens,
+                    },
+                    "prompt_tokens": input_len,
+                    "completion_tokens": generated_tokens,
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
 
             elapsed = time.time() - t_start
             logger.info(
                 f"[{request_id}] streamed {generated_tokens} tokens in {elapsed:.2f}s "
                 f"({generated_tokens / elapsed:.1f} tok/s)"
             )
-
+        finally:
+            if not thread_started:
+                _inference_semaphore.release()
     finally:
         with _queue_lock:
             _queue_counter -= 1
@@ -577,6 +685,7 @@ async def chat_completions(req: ChatCompletionRequest):
     created    = int(time.time())
 
     logger.info(f"[{request_id}] stream={req.stream} thinking={req.enable_thinking} max_tokens={req.max_tokens}")
+    logger.info(f"[{request_id}] RAW REQ DUMP: {req.model_dump()}")
 
     if req.n and req.n != 1:
         return _error(400, "Only n=1 is supported.", "invalid_request_error", "unsupported_n")
@@ -594,6 +703,19 @@ async def chat_completions(req: ChatCompletionRequest):
     effective_do_sample = req.do_sample or (req.temperature is not None and req.temperature != 1.0)
     effective_max_tokens = req.max_completion_tokens or req.max_tokens or 512
 
+    # Map reasoning_effort → enable_thinking.
+    # "high" activates thinking; "low" / "medium" / None leave it off.
+    effective_thinking = (
+        (req.enable_thinking or False)
+        or (req.reasoning_effort is not None and req.reasoning_effort.lower() == "high")
+    )
+
+    if req.response_format and req.response_format.type not in (None, "text"):
+        logger.warning(
+            f"[{request_id}] response_format.type={req.response_format.type!r} "
+            "requested but not enforced — returning plain text"
+        )
+
     # ── Queue capacity check ──────────────────────────────────────────────────
     global _queue_counter
     with _queue_lock:
@@ -605,14 +727,16 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if req.stream:
         return StreamingResponse(
-            _stream_response(req, request_id, created, effective_do_sample, effective_max_tokens),
+            _stream_response(req, request_id, created, effective_do_sample, effective_max_tokens, effective_thinking),
             media_type="text/event-stream"
         )
     else:
         try:
-            async with _inference_semaphore:
-                loop = asyncio.get_running_loop()
-                t0 = time.time()
+            await _inference_semaphore.acquire()
+            loop = asyncio.get_running_loop()
+            
+            t0 = time.time()
+            try:
                 thinking, response_text, input_tokens, output_tokens, finish_reason = \
                     await loop.run_in_executor(
                         executor,
@@ -621,13 +745,16 @@ async def chat_completions(req: ChatCompletionRequest):
                             req.messages,
                             effective_max_tokens,
                             effective_do_sample,
-                            req.enable_thinking or False,
+                            effective_thinking,
                             req.temperature,
                             req.top_p,
                             req.top_k,
                             req.repetition_penalty,
                         )
                     )
+            finally:
+                _inference_semaphore.release()
+            
             elapsed = time.time() - t0
             logger.info(f"[{request_id}] Generated {output_tokens} tokens in {elapsed:.2f}s "
                         f"({output_tokens/elapsed:.1f} tok/s)")
