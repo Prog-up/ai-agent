@@ -105,7 +105,10 @@ if DEVICE not in devices and DEVICE != "AUTO":
 logger.info(f"Available devices: {devices}")
 logger.info(f"Using device: {DEVICE}")
 
-ov_config = {"INFERENCE_PRECISION_HINT": "f32"}
+ov_config = {
+    "INFERENCE_PRECISION_HINT": "f32",
+    "CACHE_DIR": "/tmp/model_cache"
+}
 
 logger.info("Loading model...")
 t0 = time.time()

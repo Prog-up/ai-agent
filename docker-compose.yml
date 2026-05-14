@@ -12,6 +12,12 @@ services:
     environment:
       - OV_CPU_BACKEND_NUM_THREADS=12
       - MAX_INPUT_TOKENS=65536
+    deploy:
+      resources:
+        limits:
+          memory: 64g
+    devices:
+      - "/dev/dri:/dev/dri"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
