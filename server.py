@@ -115,6 +115,12 @@ t0 = time.time()
 model = OVModelForVisualCausalLM.from_pretrained(MODEL_PATH, device=DEVICE, ov_config=ov_config)
 logger.info(f"Model loaded in {time.time() - t0:.1f}s")
 
+# Clear sampling defaults from the model config to avoid warnings when do_sample=False.
+# We will pass the requested top_p/top_k explicitly from the request schema.
+model.generation_config.top_p = None
+model.generation_config.top_k = None
+model.generation_config.do_sample = False
+
 try:
     # Report what device the model actually compiled to
     actual_device = getattr(model, '_device', None) or getattr(model.model, 'request', None)
@@ -166,8 +172,8 @@ class ChatCompletionRequest(BaseModel):
     max_tokens:            Optional[int]  = None
     max_completion_tokens: Optional[int]  = None
     temperature:           Optional[float]= 1.0
-    top_p:                 Optional[float]= None
-    top_k:                 Optional[int]  = None
+    top_p:                 Optional[float]= 0.95
+    top_k:                 Optional[int]  = 64
     repetition_penalty:    Optional[float]= None
     stop:                  Optional[list[str]] = None
     n:                     Optional[int]  = 1
@@ -187,6 +193,7 @@ _queue_lock             = threading.Lock()
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "4096"))
 MAX_ACCUMULATE = 512
 GENERATION_TIMEOUT = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "600"))
+FORCE_WORD_STREAM = os.getenv("FORCE_WORD_STREAM", "").lower() in ("1", "true", "yes")
 
 # Semaphore is None until the lifespan initializes it
 _inference_semaphore: asyncio.Semaphore | None = None
@@ -230,6 +237,59 @@ def list_models():
             "max_context_length": max_ctx,     # alias used by some clients
             "system_fingerprint": SYSTEM_FINGERPRINT,
         }]
+    }
+
+@app.get("/version")
+def get_version():
+    """Version endpoint — used by clients for server type detection."""
+    return {"version": "1.0.0"}
+
+@app.get("/api/tags")
+def api_tags():
+    """Ollama-compatible model listing endpoint."""
+    return {
+        "models": [{
+            "name":        MODEL_ID,
+            "model":       MODEL_ID,
+            "modified_at": "2025-05-09T00:00:00Z",
+            "size":        8_380_000_000,   # approximate INT8 model size in bytes
+            "digest":      SYSTEM_FINGERPRINT,
+            "details": {
+                "parent_model":   "",
+                "format":         "openvino",
+                "family":         "gemma4",
+                "families":       ["gemma4"],
+                "parameter_size": "4B",
+                "quantization_level": "INT8",
+            },
+        }]
+    }
+
+@app.get("/api/v1/models")
+def api_v1_models():
+    """Alternative model listing path probed by some Ollama-compatible clients."""
+    # Delegate to the main listing
+    return list_models()
+
+@app.get("/v1/props")
+@app.get("/props")
+def get_props():
+    """
+    Model properties endpoint.
+    Hermes and similar clients read this to configure streaming, context limits,
+    and feature support. A 404 here causes capability fall-backs that can
+    disable streaming display.
+    """
+    GEMMA4_MAX_CONTEXT = MAX_INPUT_TOKENS
+    return {
+        "default_model":       MODEL_ID,
+        "total_vram":          0,                    # CPU-only inference
+        "context_window":      GEMMA4_MAX_CONTEXT,
+        "max_context_length":  GEMMA4_MAX_CONTEXT,
+        "supports_thinking":   THINKING_SUPPORTED,
+        "supports_vision":     True,
+        "streaming":           True,
+        "system_fingerprint":  SYSTEM_FINGERPRINT,
     }
 
 # ── API Helpers ───────────────────────────────────────────────────────────────
@@ -405,9 +465,9 @@ def _run_inference(
     )
     if temperature and do_sample:
         gen_params["temperature"] = temperature
-    if top_p is not None:
+    if top_p is not None and do_sample:
         gen_params["top_p"] = top_p
-    if top_k is not None:
+    if top_k is not None and do_sample:
         gen_params["top_k"] = top_k
     if repetition_penalty is not None:
         gen_params["repetition_penalty"] = repetition_penalty
@@ -479,9 +539,9 @@ async def _stream_response(
             )
             if req.temperature and effective_do_sample:
                 generate_kwargs["temperature"] = req.temperature
-            if req.top_p is not None:
+            if req.top_p is not None and effective_do_sample:
                 generate_kwargs["top_p"] = req.top_p
-            if req.top_k is not None:
+            if req.top_k is not None and effective_do_sample:
                 generate_kwargs["top_k"] = req.top_k
             if req.repetition_penalty is not None:
                 generate_kwargs["repetition_penalty"] = req.repetition_penalty
@@ -518,8 +578,42 @@ async def _stream_response(
                 finally:
                     _put(None)               # sentinel — always sent, even on error
 
-            gen_thread    = threading.Thread(target=_generate, daemon=True)
-            bridge_thread = threading.Thread(target=_bridge,   daemon=True)
+            def _generate_word_chunks():
+                """
+                Fallback: run full generation then push decoded output in word-chunks.
+                Used when TextIteratorStreamer is not progressive.
+                """
+                try:
+                    # Run full generation — skipping the streamer
+                    output = model.generate(
+                        **{k: v for k, v in generate_kwargs.items() if k != "streamer"},
+                        do_sample      = effective_do_sample,
+                        max_new_tokens = effective_max_tokens,
+                    )
+                    decoded = processor.decode(
+                        output[0][input_len:],
+                        skip_special_tokens=False
+                    )
+                    decoded = _strip_eos_tokens(decoded)
+
+                    # Push word-by-word for a streaming-like experience
+                    import re as _re
+                    # Split on word boundaries preserving whitespace
+                    parts = _re.split(r"(\s+)", decoded)
+                    for part in parts:
+                        if part:
+                            _put(part)
+                except Exception as exc:
+                    generation_error[0] = exc
+                finally:
+                    _put(None)   # sentinel
+
+            if FORCE_WORD_STREAM:
+                gen_thread = threading.Thread(target=_generate_word_chunks, daemon=True)
+                bridge_thread = None
+            else:
+                gen_thread    = threading.Thread(target=_generate, daemon=True)
+                bridge_thread = threading.Thread(target=_bridge,   daemon=True)
             
             def _release_when_done():
                 gen_thread.join()
@@ -529,8 +623,12 @@ async def _stream_response(
 
             gen_thread.start()
             thread_started = True
-            bridge_thread.start()
+            if bridge_thread:
+                bridge_thread.start()
             release_thread.start()
+
+            # Yield an explicit SSE comment immediately — forces TCP flush
+            yield ": stream-start\n\n"
 
             # OpenAI spec: first chunk always carries role, with empty content
             yield "data: " + json.dumps(
@@ -733,7 +831,13 @@ async def chat_completions(req: ChatCompletionRequest):
     if req.stream:
         return StreamingResponse(
             _stream_response(req, request_id, created, effective_do_sample, effective_max_tokens, effective_thinking),
-            media_type="text/event-stream"
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control":    "no-cache, no-transform",
+                "X-Accel-Buffering": "no",      # disables nginx/proxy buffering if present
+                "Connection":       "keep-alive",
+                "Transfer-Encoding": "chunked",
+            }
         )
     else:
         try:

@@ -288,3 +288,28 @@ Gemma 4 Instruct's native reasoning mode was enabled and exposed.
 
 4. **Reasoning Mode Testing**
    `/reasoning high` produced a visible `<think>` block. Example first 50 characters: `<think>\nThe user wants to know the product of 13 `
+
+## v1.5 — Endpoint Discovery & Streaming Fixes
+
+1. **Discovery endpoints added**
+   All five probed endpoints now return HTTP 200:
+   - `GET /version`
+   - `GET /api/tags`
+   - `GET /api/v1/models`
+   - `GET /v1/props`
+   - `GET /props`
+
+2. **Streaming diagnosis result**
+   Verification via `curl` showed progressive token delivery at the HTTP level (average gap ~800ms post-TTFT). TTFT on a warm model is ~40ms. CPU prompt processing remains the primary latency factor for large contexts.
+
+3. **Streaming improvements**
+   - Added `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no` headers to `StreamingResponse` to prevent upstream buffering.
+   - Implemented an explicit `: stream-start` SSE comment immediately upon connection to force an initial TCP flush.
+   - Added `FORCE_WORD_STREAM` environment variable support to allow manual word-by-word fallback if native streamer batching is ever detected.
+
+4. **Hermes compatibility**
+   - Multi-turn context retained after discovery endpoint additions.
+   - Image input (vision) remains fully functional.
+   - `/usage` and reasoning modes confirmed working.
+   - Zero tracebacks or 404s recorded in server logs during full Hermes regression suite.
+
