@@ -313,3 +313,19 @@ Gemma 4 Instruct's native reasoning mode was enabled and exposed.
    - `/usage` and reasoning modes confirmed working.
    - Zero tracebacks or 404s recorded in server logs during full Hermes regression suite.
 
+## v1.6 — Final Fix Consolidation
+
+1. **Thinking Boundary Protection (Fix 1)**: Added `_THINKING_BOUNDARY_TAGS` guard to ensure thinking tags (`<think>`, etc.) are never stripped by the automated EOS cleanup, preserving reasoning mode integrity.
+2. **Usage Chunk Cleanup (Fix 2)**: Removed duplicate top-level `prompt_tokens` and `completion_tokens` from the streaming usage payload, strictly adhering to the standard `usage` object nesting.
+3. **Temperature-Zero Logic (Fix 3)**: Corrected `effective_do_sample` to ensure `temperature=0.0` or `temperature=None` strictly triggers greedy decoding, preventing random sampling errors.
+4. **Dead Code Purge (Fix 4+5)**: Removed the unused `_thread_waiter` function and the redundant `AsyncIterator` import.
+5. **Semaphore Safety (Fix 6)**: Implemented a robust `_semaphore_acquired` flag in the non-streaming path to guarantee semaphore release even if a request is cancelled immediately after acquisition.
+6. **Linting & Spacing (Fix 7)**: Added standard PEP 8 blank lines before the main completion endpoint.
+7. **Word-Stream Kwarg Fix (Fix 8)**: Fixed a `TypeError` in the `_generate_word_chunks` fallback where `do_sample` and `max_new_tokens` were being passed as duplicate keyword arguments.
+
+### Observed Behavior
+- **EOS Strip List**: `['<end_of_turn>', '<bos>', '<eos>']` (Verified: thinking tags successfully excluded).
+- **Determinism**: `temperature=0.0` verified deterministic across multiple runs.
+- **SDK Compatibility**: Fully verified with the standard OpenAI Python SDK for both streaming and non-streaming modes.
+
+

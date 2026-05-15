@@ -18,7 +18,7 @@ import re
 import threading
 import concurrent.futures
 import functools
-from typing import Optional, AsyncIterator
+from typing import Optional
 from contextlib import asynccontextmanager
 
 from PIL import Image as PILImage
@@ -38,6 +38,11 @@ logger = logging.getLogger("gemma4-server")
 THINK_START_TAGS  = ["<|channel>thought", "<think>"]
 THINK_END_TAGS    = ["<channel|>", "</think>", "<|channel>"]
 CLEANUP_TAGS      = ["<turn|>", "<channel|>", "<|channel>", "<end_of_turn>", "<eos>", "<bos>"]
+# Tags that mark thinking boundaries — must NEVER be stripped from raw output
+# before parse_thinking runs, even if the tokenizer registers them as special tokens.
+_THINKING_BOUNDARY_TAGS: frozenset[str] = frozenset(
+    THINK_START_TAGS + THINK_END_TAGS
+)
 # All tags in one flat list — used for prefix-buffer safety in the streamer
 ALL_TAGS          = THINK_START_TAGS + THINK_END_TAGS + CLEANUP_TAGS
 _MAX_TAG_LEN      = max(len(t) for t in ALL_TAGS)
@@ -78,6 +83,10 @@ def _build_eos_strip_list() -> list[str]:
             for t in tok.additional_special_tokens:
                 # Only strip tokens that look like control tokens, not content
                 if t.startswith('<') and t.endswith('>') and len(t) < 30:
+                    # Never strip thinking boundary markers — parse_thinking needs them
+                    if t in _THINKING_BOUNDARY_TAGS:
+                        logger.debug(f"Skipping thinking boundary tag from EOS strip list: {t!r}")
+                        continue
                     tokens.add(t)
     except Exception as e:
         logger.warning(f"Could not build full EOS strip list: {e}")
@@ -463,7 +472,7 @@ def _run_inference(
         do_sample        = do_sample,
         max_new_tokens   = max_new_tokens,
     )
-    if temperature and do_sample:
+    if do_sample and temperature is not None and temperature > 0.0:
         gen_params["temperature"] = temperature
     if top_p is not None and do_sample:
         gen_params["top_p"] = top_p
@@ -484,17 +493,6 @@ def _run_inference(
     response = _clean_tags(response)
     return thinking, response, input_len, output_len, finish_reason
 
-
-@asynccontextmanager
-async def _thread_waiter(gen_thread, bridge_thread):
-    try:
-        yield
-    finally:
-        loop = asyncio.get_running_loop()
-        if gen_thread.is_alive():
-            await loop.run_in_executor(None, gen_thread.join)
-        if bridge_thread.is_alive():
-            await loop.run_in_executor(None, bridge_thread.join)
 
 async def _stream_response(
     req: ChatCompletionRequest,
@@ -537,7 +535,7 @@ async def _stream_response(
                 do_sample      = effective_do_sample,
                 max_new_tokens = effective_max_tokens,
             )
-            if req.temperature and effective_do_sample:
+            if effective_do_sample and req.temperature is not None and req.temperature > 0.0:
                 generate_kwargs["temperature"] = req.temperature
             if req.top_p is not None and effective_do_sample:
                 generate_kwargs["top_p"] = req.top_p
@@ -584,12 +582,9 @@ async def _stream_response(
                 Used when TextIteratorStreamer is not progressive.
                 """
                 try:
-                    # Run full generation — skipping the streamer
-                    output = model.generate(
-                        **{k: v for k, v in generate_kwargs.items() if k != "streamer"},
-                        do_sample      = effective_do_sample,
-                        max_new_tokens = effective_max_tokens,
-                    )
+                    # Strip the streamer key — generate_kwargs already has do_sample and max_new_tokens
+                    clean_kwargs = {k: v for k, v in generate_kwargs.items() if k != "streamer"}
+                    output = model.generate(**clean_kwargs)
                     decoded = processor.decode(
                         output[0][input_len:],
                         skip_special_tokens=False
@@ -598,7 +593,6 @@ async def _stream_response(
 
                     # Push word-by-word for a streaming-like experience
                     import re as _re
-                    # Split on word boundaries preserving whitespace
                     parts = _re.split(r"(\s+)", decoded)
                     for part in parts:
                         if part:
@@ -766,8 +760,6 @@ async def _stream_response(
                         "completion_tokens": generated_tokens,
                         "total_tokens":      input_len + generated_tokens,
                     },
-                    "prompt_tokens": input_len,
-                    "completion_tokens": generated_tokens,
                 }
                 yield f"data: {json.dumps(usage_chunk)}\n\n"
             yield "data: [DONE]\n\n"
@@ -783,6 +775,8 @@ async def _stream_response(
     finally:
         with _queue_lock:
             _queue_counter -= 1
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -803,7 +797,13 @@ async def chat_completions(req: ChatCompletionRequest):
         return _error(400, f"Request too large (estimated input exceeds {MAX_INPUT_TOKENS} tokens).",
                       "invalid_request_error", "context_length_exceeded")
 
-    effective_do_sample = req.do_sample or (req.temperature is not None and req.temperature != 1.0)
+    # Enable sampling only when temperature is meaningfully above zero and not the default.
+    # temperature=0 or temperature=None means greedy — do NOT set do_sample=True.
+    effective_do_sample = req.do_sample or (
+        req.temperature is not None
+        and req.temperature > 0.0
+        and req.temperature != 1.0
+    )
     effective_max_tokens = req.max_completion_tokens or req.max_tokens or 512
 
     # Map reasoning_effort → enable_thinking.
@@ -840,46 +840,45 @@ async def chat_completions(req: ChatCompletionRequest):
             }
         )
     else:
+        _semaphore_acquired = False
         try:
             await _inference_semaphore.acquire()
+            _semaphore_acquired = True
+
             loop = asyncio.get_running_loop()
-            
-            t0 = time.time()
-            try:
-                thinking, response_text, input_tokens, output_tokens, finish_reason = \
-                    await loop.run_in_executor(
-                        executor,
-                        functools.partial(
-                            _run_inference,
-                            req.messages,
-                            effective_max_tokens,
-                            effective_do_sample,
-                            effective_thinking,
-                            req.temperature,
-                            req.top_p,
-                            req.top_k,
-                            req.repetition_penalty,
-                        )
+            t0   = time.time()
+
+            thinking, response_text, input_tokens, output_tokens, finish_reason = \
+                await loop.run_in_executor(
+                    executor,
+                    functools.partial(
+                        _run_inference,
+                        req.messages,
+                        effective_max_tokens,
+                        effective_do_sample,
+                        effective_thinking,
+                        req.temperature,
+                        req.top_p,
+                        req.top_k,
+                        req.repetition_penalty,
                     )
-            finally:
-                _inference_semaphore.release()
-            
+                )
+
             elapsed = time.time() - t0
             logger.info(f"[{request_id}] Generated {output_tokens} tokens in {elapsed:.2f}s "
                         f"({output_tokens/elapsed:.1f} tok/s)")
 
             response_text = _apply_stop_sequences(response_text, req.stop)
-            
+
             if thinking:
                 response_text = f"<think>\n{thinking}\n</think>\n\n{response_text}"
-            
+
             # Guard: log if content is empty so we can diagnose it
             final_content = response_text.strip()
             if not final_content:
                 logger.error(
                     f"[{request_id}] EMPTY CONTENT after processing. "
                     f"raw thinking present: {bool(thinking)}, "
-                    f"raw response_text before strip: {response_text!r}, "
                     f"output_tokens: {output_tokens}"
                 )
 
@@ -899,6 +898,8 @@ async def chat_completions(req: ChatCompletionRequest):
                 }
             })
         finally:
+            if _semaphore_acquired:
+                _inference_semaphore.release()
             with _queue_lock:
                 _queue_counter -= 1
 
