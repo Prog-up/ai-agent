@@ -8,20 +8,25 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - /opt/models/gemma-4-E4B-it-int8-ov:/models:ro
+      - ./models/gemma-4-E4B-it-int4-ov:/models:ro
     environment:
       - OV_CPU_BACKEND_NUM_THREADS=12
-      - MAX_INPUT_TOKENS=65536
+      - MAX_INPUT_TOKENS=8192
+      - OPENVINO_CACHE_DIR=/tmp/model_cache
+      - MODEL_ID=OpenVINO/gemma-4-E4B-it-int4-ov
+      - NEO_CACHE_PERSISTENT=0
     deploy:
       resources:
         limits:
           memory: 64g
     devices:
       - "/dev/dri:/dev/dri"
+    group_add:
+      - video
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
-      start_period: 180s
+      start_period: 300s
       retries: 3

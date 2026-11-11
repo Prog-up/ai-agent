@@ -27,11 +27,14 @@ import openvino as ov
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
-from transformers import AutoProcessor, TextIteratorStreamer
+from transformers import AutoProcessor, TextIteratorStreamer, TextStreamer
 from optimum.intel.openvino import OVModelForVisualCausalLM
 from prometheus_fastapi_instrumentator import Instrumentator
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(threadName)s] %(levelname)s:%(name)s:%(message)s"
+)
 logger = logging.getLogger("gemma4-server")
 
 # ── Thinking tag constants ────────────────────────────────────────────────────
@@ -49,7 +52,7 @@ _MAX_TAG_LEN      = max(len(t) for t in ALL_TAGS)
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 MODEL_PATH = "/models"
-MODEL_ID   = "OpenVINO/gemma-4-E4B-it-int8-ov"
+MODEL_ID   = os.getenv("MODEL_ID", "OpenVINO/gemma-4-E4B-it-int8-ov")
 
 if not os.path.isdir(MODEL_PATH):
     raise RuntimeError(
@@ -102,41 +105,88 @@ def _strip_eos_tokens(text: str) -> str:
         text = text.replace(token, "")
     return text
 
-core = ov.Core()
-devices = core.available_devices
-DEVICE = os.getenv("DEVICE", "GPU" if "GPU" in devices else "CPU")
-if DEVICE not in devices and DEVICE != "AUTO":
-    logger.warning(
-        f"Requested device '{DEVICE}' not found in available devices {devices}. "
-        f"Falling back to CPU."
-    )
-    DEVICE = "CPU"
-logger.info(f"Available devices: {devices}")
-logger.info(f"Using device: {DEVICE}")
+core    = None
+devices = []
+DEVICE  = "GPU"
+ov_config = {}
+model   = None
+available_devices_list = []
 
-ov_config = {
-    "INFERENCE_PRECISION_HINT": "f32",
-    "CACHE_DIR": "/tmp/model_cache"
-}
+# ── Persistent cache ──────────────────────────────────────────────────────────
+OPENVINO_CACHE_DIR = os.getenv("OPENVINO_CACHE_DIR", "/tmp/model_cache")
+os.makedirs(OPENVINO_CACHE_DIR, exist_ok=True)
+logger.info(f"OpenVINO model cache: {OPENVINO_CACHE_DIR}")
 
-logger.info("Loading model...")
-t0 = time.time()
-model = OVModelForVisualCausalLM.from_pretrained(MODEL_PATH, device=DEVICE, ov_config=ov_config)
-logger.info(f"Model loaded in {time.time() - t0:.1f}s")
+def _initialize_model():
+    global core, devices, DEVICE, ov_config, model, available_devices_list
+    logger.info("Initializing OpenVINO runtime and loading model on inference thread...")
+    t0 = time.time()
+    
+    core = ov.Core()
+    devices = list(core.available_devices)
+    available_devices_list = devices
+    DEVICE = os.getenv("DEVICE", "GPU" if "GPU" in devices else "CPU")
+    
+    if DEVICE not in devices and DEVICE != "AUTO":
+        logger.warning(
+            f"Requested device '{DEVICE}' not found in {devices}. Falling back to CPU."
+        )
+        DEVICE = "CPU"
+        
+    logger.info(f"Available devices: {devices}")
+    logger.info(f"Using device: {DEVICE}")
+    
+    # ── Device-conditional ov_config ──────────────────────────────────────────────
+    if "GPU" in DEVICE:
+        # Intel iGPU / Arc GPU: optimize for single-request latency.
+        # KV_CACHE_PRECISION u8 keeps the KV cache in INT8 on GPU memory,
+        # halving KV cache VRAM vs f32 — critical for iGPU where model and
+        # KV cache compete for shared system RAM.
+        # DYNAMIC_QUANTIZATION_GROUP_SIZE enables runtime INT8 quantization
+        # of activations in groups of 32, leveraging Intel XMX units on
+        # 12th-gen+ Iris Xe / Arc. Set to 0 to disable.
+        ov_config = {
+            "PERFORMANCE_HINT":              "LATENCY",
+            "INFERENCE_PRECISION_HINT":      os.getenv("OV_INFERENCE_PRECISION", "f32"),
+            "KV_CACHE_PRECISION":            os.getenv("OV_KV_CACHE_PRECISION", "f16"),
+            "DYNAMIC_QUANTIZATION_GROUP_SIZE": os.getenv("OV_DYN_QUANT_GROUP_SIZE", "0"),
+            "CACHE_DIR":                     OPENVINO_CACHE_DIR,
+        }
+        logger.info(f"GPU ov_config: {ov_config}")
+    else:
+        # Intel CPU: optimize for single-request latency.
+        # NUM_STREAMS 1 avoids parallel stream overhead for sequential generation.
+        # AFFINITY NUMA binds threads to a single NUMA node — critical for
+        # dual-socket systems (prevents cross-socket memory access penalty).
+        # f32 precision keeps output quality on INT4/INT8 quantized weights.
+        ov_config = {
+            "PERFORMANCE_HINT":      "LATENCY",
+            "INFERENCE_PRECISION_HINT": os.getenv("OV_INFERENCE_PRECISION", "f32"),
+            "NUM_STREAMS":           "1",
+            "AFFINITY":              os.getenv("OV_AFFINITY", "NUMA"),
+            "CACHE_DIR":             OPENVINO_CACHE_DIR,
+        }
+        logger.info(f"CPU ov_config: {ov_config}")
 
-# Clear sampling defaults from the model config to avoid warnings when do_sample=False.
-# We will pass the requested top_p/top_k explicitly from the request schema.
-model.generation_config.top_p = None
-model.generation_config.top_k = None
-model.generation_config.do_sample = False
+    logger.info("Loading model...")
+    model = OVModelForVisualCausalLM.from_pretrained(MODEL_PATH, device=DEVICE, ov_config=ov_config)
+    logger.info(f"Model loaded in {time.time() - t0:.1f}s")
+    
+    # Clear sampling defaults from the model config to avoid warnings when do_sample=False.
+    # We will pass the requested top_p/top_k explicitly from the request schema.
+    model.generation_config.top_p = None
+    model.generation_config.top_k = None
+    model.generation_config.do_sample = False
+    
+    try:
+        # Report what device the model actually compiled to
+        actual_device = getattr(model, '_device', None) or getattr(model.model, 'request', None)
+        logger.info(f"Model compiled for device (requested): {DEVICE}")
+        logger.info(f"OV_CPU_BACKEND_NUM_THREADS env: {os.getenv('OV_CPU_BACKEND_NUM_THREADS', 'not set')}")
+    except Exception:
+        pass  # best-effort
 
-try:
-    # Report what device the model actually compiled to
-    actual_device = getattr(model, '_device', None) or getattr(model.model, 'request', None)
-    logger.info(f"Model compiled for device (requested): {DEVICE}")
-    logger.info(f"OV_CPU_BACKEND_NUM_THREADS env: {os.getenv('OV_CPU_BACKEND_NUM_THREADS', 'not set')}")
-except Exception:
-    pass  # best-effort
+_initialize_model()
 
 # Identifies this build — update when the image is rebuilt
 SYSTEM_FINGERPRINT = f"gemma4-ovms-{MODEL_ID.split('/')[-1]}"
@@ -158,7 +208,8 @@ def _probe_thinking_support() -> bool:
 THINKING_SUPPORTED = _probe_thinking_support()
 
 # ── Thread Pool ──────────────────────────────────────────────────────────────
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count())
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="inference")
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 class Message(BaseModel):
@@ -181,8 +232,8 @@ class ChatCompletionRequest(BaseModel):
     max_tokens:            Optional[int]  = None
     max_completion_tokens: Optional[int]  = None
     temperature:           Optional[float]= 1.0
-    top_p:                 Optional[float]= 0.95
-    top_k:                 Optional[int]  = 64
+    top_p:                 Optional[float] = None
+    top_k:                 Optional[int]   = None
     repetition_penalty:    Optional[float]= None
     stop:                  Optional[list[str]] = None
     n:                     Optional[int]  = 1
@@ -207,13 +258,32 @@ FORCE_WORD_STREAM = os.getenv("FORCE_WORD_STREAM", "").lower() in ("1", "true", 
 # Semaphore is None until the lifespan initializes it
 _inference_semaphore: asyncio.Semaphore | None = None
 
+def _warmup_inference():
+    """
+    Runs a minimal generation to trigger OpenVINO JIT/shader compilation.
+    Result is cached in OPENVINO_CACHE_DIR. Called once at startup.
+    """
+    try:
+        logger.info(f"Running warmup inference on {DEVICE} to pre-compile graphs...")
+        t0 = time.time()
+        warmup_msgs = [{"role":"user","content":[{"type":"text","text":"Hi"}]}]
+        tmpl   = processor.apply_chat_template(warmup_msgs, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=tmpl, return_tensors="pt")
+        _      = model.generate(**inputs, do_sample=False, max_new_tokens=3)
+        elapsed = time.time() - t0
+        logger.info(f"Warmup complete in {elapsed:.1f}s — graphs compiled and cached at {OPENVINO_CACHE_DIR}")
+    except Exception as e:
+        logger.warning(f"Warmup inference failed (non-fatal, will compile on first request): {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _inference_semaphore
     _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     logger.info(f"Inference semaphore initialized (max_concurrent={MAX_CONCURRENT_REQUESTS}, max_queued={MAX_QUEUED_REQUESTS})")
+    # Run warmup directly on MainThread
+    _warmup_inference()
     yield
-    # Shutdown: nothing to clean up for the semaphore
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Gemma 4 OpenVINO OpenAI API", version="1.0.0", lifespan=lifespan)
@@ -226,7 +296,7 @@ def health():
         "status": "ok",
         "model": MODEL_ID,
         "device": DEVICE,
-        "available_devices": list(core.available_devices),
+        "available_devices": available_devices_list,
         "thinking_supported": THINKING_SUPPORTED
     }
 
@@ -387,6 +457,11 @@ def _prepare_inputs(messages: list, enable_thinking: bool) -> tuple:
     else:
         inputs = processor(text=text, return_tensors="pt")
 
+    logger.info(f"Inputs keys: {list(inputs.keys())}")
+    for k, v in inputs.items():
+        if hasattr(v, "shape"):
+            logger.info(f"Input key '{k}' shape: {v.shape}, tensor: {v.tolist()}")
+
     return inputs, inputs["input_ids"].shape[-1]
 
 def _safe_prefix_len(text: str) -> int:
@@ -466,6 +541,11 @@ def _run_inference(
     repetition_penalty: Optional[float]     = None,
 ) -> tuple[str, str, int, int, str]:
     """Returns (thinking, response_text, input_token_count, output_token_count, finish_reason)."""
+    logger.info(
+        f"[_run_inference] max_new_tokens={max_new_tokens} do_sample={do_sample} "
+        f"enable_thinking={enable_thinking} temperature={temperature} top_p={top_p} "
+        f"top_k={top_k} repetition_penalty={repetition_penalty} messages={messages}"
+    )
     inputs, input_len = _prepare_inputs(messages, enable_thinking)
 
     gen_params = dict(
@@ -481,6 +561,7 @@ def _run_inference(
     if repetition_penalty is not None:
         gen_params["repetition_penalty"] = repetition_penalty
 
+    logger.info(f"[_run_inference] model.generate inputs keys: {list(inputs.keys())}, gen_params: {gen_params}")
     output = model.generate(**inputs, **gen_params)
     output_len = output.shape[-1] - input_len
     finish_reason = "length" if output_len >= max_new_tokens else "stop"
@@ -548,8 +629,13 @@ async def _stream_response(
 
             generation_error: list[BaseException | None] = [None]
 
+            _tokenizer = (
+                getattr(processor, 'tokenizer', None)
+                or getattr(processor, 'text_tokenizer', None)
+                or processor
+            )
             streamer = TextIteratorStreamer(
-                processor.tokenizer,
+                _tokenizer,
                 skip_prompt=True,
                 skip_special_tokens=False,
             )
@@ -603,19 +689,21 @@ async def _stream_response(
                     _put(None)   # sentinel
 
             if FORCE_WORD_STREAM:
-                gen_thread = threading.Thread(target=_generate_word_chunks, daemon=True)
+                gen_future = inference_executor.submit(_generate_word_chunks)
                 bridge_thread = None
             else:
-                gen_thread    = threading.Thread(target=_generate, daemon=True)
+                gen_future    = inference_executor.submit(_generate)
                 bridge_thread = threading.Thread(target=_bridge,   daemon=True)
             
             def _release_when_done():
-                gen_thread.join()
+                try:
+                    gen_future.result()
+                except Exception as exc:
+                    logger.error(f"[{request_id}] Generation task failed: {exc}")
                 loop.call_soon_threadsafe(_inference_semaphore.release)
                 
             release_thread = threading.Thread(target=_release_when_done, daemon=True)
 
-            gen_thread.start()
             thread_started = True
             if bridge_thread:
                 bridge_thread.start()
@@ -845,25 +933,24 @@ async def chat_completions(req: ChatCompletionRequest):
             await _inference_semaphore.acquire()
             _semaphore_acquired = True
 
-            loop = asyncio.get_running_loop()
-            t0   = time.time()
-
+            t0 = time.time()
+            try:
+                logger.info("Running a test warmup inference inside request handler...")
+                _warmup_inference()
+            except Exception as w_err:
+                logger.error(f"Warmup inside request handler failed: {w_err}")
+                
             thinking, response_text, input_tokens, output_tokens, finish_reason = \
-                await loop.run_in_executor(
-                    executor,
-                    functools.partial(
-                        _run_inference,
-                        req.messages,
-                        effective_max_tokens,
-                        effective_do_sample,
-                        effective_thinking,
-                        req.temperature,
-                        req.top_p,
-                        req.top_k,
-                        req.repetition_penalty,
-                    )
+                _run_inference(
+                    req.messages,
+                    effective_max_tokens,
+                    effective_do_sample,
+                    effective_thinking,
+                    req.temperature,
+                    req.top_p,
+                    req.top_k,
+                    req.repetition_penalty,
                 )
-
             elapsed = time.time() - t0
             logger.info(f"[{request_id}] Generated {output_tokens} tokens in {elapsed:.2f}s "
                         f"({output_tokens/elapsed:.1f} tok/s)")
@@ -904,4 +991,366 @@ async def chat_completions(req: ChatCompletionRequest):
                 _queue_counter -= 1
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    import http.server
+    import urllib.parse
+
+    class StopGenerationException(Exception):
+        pass
+
+    class HTTPStreamer(TextStreamer):
+        def __init__(self, tokenizer, request_handler, request_id, created, model_name, req_stop=None, **decode_kwargs):
+            super().__init__(tokenizer, skip_prompt=True, **decode_kwargs)
+            self.request_handler = request_handler
+            self.request_id = request_id
+            self.created = created
+            self.model_name = model_name
+            self.req_stop = req_stop
+            self.generated_tokens = 0
+            self.stop_triggered = False
+            self.in_thinking = False
+            self.accumulated = ""
+
+        def on_finalized_text(self, text: str, stream_end: bool = False):
+            if self.stop_triggered:
+                return
+
+            if text:
+                self.generated_tokens += 1
+                self.accumulated += text
+
+                while True:
+                    found = False
+                    if not self.in_thinking:
+                        for tag in THINK_START_TAGS:
+                            if tag in self.accumulated:
+                                pos = self.accumulated.find(tag)
+                                before = _clean_tags(self.accumulated[:pos])
+                                if before:
+                                    chunk = _make_chunk(self.request_id, self.created, self.model_name, {'content': before})
+                                    self.request_handler.send_chunk(f"data: {json.dumps(chunk)}\n\n")
+                                self.in_thinking = True
+                                self.accumulated = self.accumulated[pos + len(tag):]
+                                chunk = _make_chunk(self.request_id, self.created, self.model_name, {'content': '<think>\n'})
+                                self.request_handler.send_chunk(f"data: {json.dumps(chunk)}\n\n")
+                                found = True
+                                break
+                    else:
+                        for tag in THINK_END_TAGS:
+                            if tag in self.accumulated:
+                                pos = self.accumulated.find(tag)
+                                before = self.accumulated[:pos]
+                                if before:
+                                    chunk = _make_chunk(self.request_id, self.created, self.model_name, {'content': before})
+                                    self.request_handler.send_chunk(f"data: {json.dumps(chunk)}\n\n")
+                                self.in_thinking = False
+                                self.accumulated = self.accumulated[pos + len(tag):]
+                                chunk = _make_chunk(self.request_id, self.created, self.model_name, {'content': '\n</think>\n\n'})
+                                self.request_handler.send_chunk(f"data: {json.dumps(chunk)}\n\n")
+                                found = True
+                                break
+                    if not found:
+                        break
+
+                tail_len = _safe_prefix_len(self.accumulated)
+                if len(self.accumulated) > MAX_ACCUMULATE:
+                    tail_len = max(tail_len, _MAX_TAG_LEN)
+
+                if len(self.accumulated) > tail_len:
+                    to_yield = self.accumulated[:-tail_len] if tail_len > 0 else self.accumulated
+                    self.accumulated = self.accumulated[-tail_len:] if tail_len > 0 else ""
+                    to_yield = _clean_tags(to_yield)
+
+                    if self.req_stop:
+                        truncated = _apply_stop_sequences(to_yield, self.req_stop)
+                        if len(truncated) < len(to_yield):
+                            self.stop_triggered = True
+                            to_yield = truncated
+                            if to_yield:
+                                chunk = _make_chunk(self.request_id, self.created, self.model_name, {'content': to_yield})
+                                self.request_handler.send_chunk(f"data: {json.dumps(chunk)}\n\n")
+                            raise StopGenerationException("Stop sequence triggered")
+
+                    if to_yield:
+                        chunk = _make_chunk(self.request_id, self.created, self.model_name, {'content': to_yield})
+                        self.request_handler.send_chunk(f"data: {json.dumps(chunk)}\n\n")
+
+            if stream_end:
+                if self.accumulated:
+                    self.accumulated = _clean_tags(self.accumulated)
+                    if self.req_stop:
+                        self.accumulated = _apply_stop_sequences(self.accumulated, self.req_stop)
+                    if self.accumulated:
+                        chunk = _make_chunk(self.request_id, self.created, self.model_name, {'content': self.accumulated})
+                        self.request_handler.send_chunk(f"data: {json.dumps(chunk)}\n\n")
+    
+    class OpenAIHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format, *args):
+            logger.info("%s - - %s" % (self.address_string(), format % args))
+
+        def _send_error(self, code, message, error_type="invalid_request_error", code_str=None):
+            err_data = {
+                "error": {
+                    "message": message,
+                    "type": error_type,
+                    "param": None,
+                    "code": code_str
+                }
+            }
+            body = json.dumps(err_data).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            parsed_path = urllib.parse.urlparse(self.path)
+            if parsed_path.path == "/health":
+                health_data = {
+                    "status": "ok",
+                    "model": MODEL_ID,
+                    "device": DEVICE,
+                    "available_devices": available_devices_list,
+                    "thinking_supported": THINKING_SUPPORTED
+                }
+                body = json.dumps(health_data).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif parsed_path.path == "/v1/models":
+                max_ctx = MAX_INPUT_TOKENS
+                models_data = {
+                    "object": "list",
+                    "data": [{
+                        "id":             MODEL_ID,
+                        "object":         "model",
+                        "created":        MODEL_CREATED_AT,
+                        "owned_by":       "google/openvino",
+                        "context_length": max_ctx,
+                        "max_context_length": max_ctx,
+                        "system_fingerprint": SYSTEM_FINGERPRINT,
+                    }]
+                }
+                body = json.dumps(models_data).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif parsed_path.path == "/version":
+                body = json.dumps({"version": "1.7.0"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        def do_POST(self):
+            parsed_path = urllib.parse.urlparse(self.path)
+            if parsed_path.path == "/v1/chat/completions":
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length)
+                try:
+                    body_dict = json.loads(body.decode("utf-8"))
+                    req = ChatCompletionRequest(**body_dict)
+                except Exception as e:
+                    self._send_error(400, f"Invalid request body: {e}", "invalid_request_error", "bad_request")
+                    return
+
+                request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+                created = int(time.time())
+                logger.info(f"[{request_id}] stream={req.stream} thinking={req.enable_thinking} max_tokens={req.max_tokens}")
+
+                if req.n and req.n != 1:
+                    self._send_error(400, "Only n=1 is supported.", "invalid_request_error", "unsupported_n")
+                    return
+
+                total_chars = sum(
+                    len(m.content) if isinstance(m.content, str) else sum(
+                        len(p.get("text", "")) for p in m.content if isinstance(p, dict)
+                    )
+                    for m in req.messages
+                )
+                if total_chars > MAX_INPUT_TOKENS * 6:
+                    self._send_error(400, f"Request too large (estimated input exceeds {MAX_INPUT_TOKENS} tokens).",
+                                      "invalid_request_error", "context_length_exceeded")
+                    return
+
+                effective_do_sample = req.do_sample or (
+                    req.temperature is not None
+                    and req.temperature > 0.0
+                    and req.temperature != 1.0
+                )
+                effective_max_tokens = req.max_completion_tokens or req.max_tokens or 512
+
+                effective_thinking = (
+                    (req.enable_thinking or False)
+                    or (req.reasoning_effort is not None and req.reasoning_effort.lower() == "high")
+                )
+
+                if req.stream:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache, no-transform")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+
+                    # OpenAI spec: first chunk always carries role, with empty content
+                    first_chunk = _make_chunk(request_id, created, req.model, {"role": "assistant", "content": ""})
+                    self.send_chunk(f"data: {json.dumps(first_chunk)}\n\n")
+
+                    inputs, input_len = _prepare_inputs(req.messages, effective_thinking)
+                    generate_kwargs = dict(
+                        **inputs,
+                        do_sample=effective_do_sample,
+                        max_new_tokens=effective_max_tokens,
+                    )
+                    if effective_do_sample and req.temperature is not None and req.temperature > 0.0:
+                        generate_kwargs["temperature"] = req.temperature
+                    if req.top_p is not None and effective_do_sample:
+                        generate_kwargs["top_p"] = req.top_p
+                    if req.top_k is not None and effective_do_sample:
+                        generate_kwargs["top_k"] = req.top_k
+                    if req.repetition_penalty is not None:
+                        generate_kwargs["repetition_penalty"] = req.repetition_penalty
+
+                    _tokenizer = (
+                        getattr(processor, 'tokenizer', None)
+                        or getattr(processor, 'text_tokenizer', None)
+                        or processor
+                    )
+
+                    streamer = HTTPStreamer(
+                        _tokenizer,
+                        self,
+                        request_id,
+                        created,
+                        req.model,
+                        req_stop=req.stop,
+                        skip_special_tokens=False
+                    )
+                    generate_kwargs["streamer"] = streamer
+
+                    t_start = time.time()
+                    try:
+                        model.generate(**generate_kwargs)
+                    except StopGenerationException:
+                        logger.info(f"[{request_id}] Generation stopped early via stop sequence.")
+                    except Exception as e:
+                        logger.error(f"[{request_id}] Streaming generation error: {e}")
+
+                    streamer.end()
+
+                    finish_reason = "length" if streamer.generated_tokens >= effective_max_tokens else "stop"
+                    final_chunk = _make_chunk(request_id, created, req.model, {}, finish_reason)
+                    self.send_chunk(f"data: {json.dumps(final_chunk)}\n\n")
+
+                    # Send usage chunk if requested via stream_options
+                    if req.stream_options and req.stream_options.include_usage:
+                        usage_chunk = {
+                            "id":               request_id,
+                            "object":           "chat.completion.chunk",
+                            "created":          created,
+                            "model":            req.model,
+                            "system_fingerprint": SYSTEM_FINGERPRINT,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens":     input_len,
+                                "completion_tokens": streamer.generated_tokens,
+                                "total_tokens":      input_len + streamer.generated_tokens,
+                            },
+                        }
+                        self.send_chunk(f"data: {json.dumps(usage_chunk)}\n\n")
+
+                    self.send_chunk("data: [DONE]\n\n")
+                    self.end_chunks()
+
+                    elapsed = time.time() - t_start
+                    logger.info(
+                        f"[{request_id}] streamed {streamer.generated_tokens} tokens in {elapsed:.2f}s "
+                        f"({streamer.generated_tokens / elapsed:.1f} tok/s)"
+                    )
+                else:
+                    t0 = time.time()
+                    try:
+                        thinking, response_text, input_tokens, output_tokens, finish_reason = \
+                            _run_inference(
+                                req.messages,
+                                effective_max_tokens,
+                                effective_do_sample,
+                                effective_thinking,
+                                req.temperature,
+                                req.top_p,
+                                req.top_k,
+                                req.repetition_penalty,
+                            )
+                    except Exception as e:
+                        logger.error(f"[{request_id}] Inference failed: {e}")
+                        self._send_error(500, f"Inference failed: {e}", "server_error", "internal_error")
+                        return
+
+                    elapsed = time.time() - t0
+                    logger.info(f"[{request_id}] Generated {output_tokens} tokens in {elapsed:.2f}s ({output_tokens/elapsed:.1f} tok/s)")
+
+                    response_text = _apply_stop_sequences(response_text, req.stop)
+                    if thinking:
+                        response_text = f"<think>\n{thinking}\n</think>\n\n{response_text}"
+
+                    final_content = response_text.strip()
+                    message = {"role": "assistant", "content": final_content}
+
+                    resp_data = {
+                        "id": request_id,
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": req.model,
+                        "system_fingerprint": SYSTEM_FINGERPRINT,
+                        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+                        "usage": {
+                            "prompt_tokens": input_tokens,
+                            "completion_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                        }
+                    }
+
+                    body = json.dumps(resp_data).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        def send_chunk(self, data: str):
+            chunk_data = data.encode("utf-8")
+            chunk_len = f"{len(chunk_data):x}\r\n".encode("utf-8")
+            self.wfile.write(chunk_len)
+            self.wfile.write(chunk_data)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+
+        def end_chunks(self):
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+    server_address = ("", 8000)
+    httpd = http.server.HTTPServer(server_address, OpenAIHTTPRequestHandler)
+    logger.info("Starting production synchronous HTTP server on port 8000...")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()

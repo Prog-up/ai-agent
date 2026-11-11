@@ -39,6 +39,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
 
 # Drop to non-root
 RUN useradd -m -u 1001 ovuser
+RUN mkdir -p /home/ovuser/.cache/openvino && chown -R ovuser:ovuser /home/ovuser
 USER ovuser
 
 CMD ["python3", "/app/server.py"]
